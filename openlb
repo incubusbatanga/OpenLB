@@ -1,0 +1,3036 @@
+#!/usr/bin/perl
+#
+# OpenLB (Open Load Balancer)
+#
+# Copyright (c) 2014 Marko Dinic <marko@yu.net>. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+##############################################################################################
+
+our $VERSION = "0.6";
+
+##############################################################################################
+
+our ($ABSPATH, $PREFIX, $COMMAND, $LIBDIR, $SYSCONFDIR, $LOCALSTATEDIR);
+
+BEGIN {
+
+    use Cwd qw(abs_path);
+    $ABSPATH = abs_path($0);
+    ($PREFIX, $COMMAND) = ($ABSPATH =~ /^(?:(.*)\/)?([^\/]+)$/);
+
+##############################################################################################
+# DEFAULT PATHS BEGIN (change if neccessary)
+##############################################################################################
+
+
+    $LIBDIR = $PREFIX.'/lib';
+    $SYSCONFDIR = $PREFIX.'/etc';
+    $LOCALSTATEDIR = '/var';
+
+
+##############################################################################################
+# DEFAULT PATHS END (don't change anything below this line)
+##############################################################################################
+
+}
+
+##############################################################################################
+
+use lib $LIBDIR;
+
+##############################################################################################
+
+use strict;
+use warnings;
+
+##############################################################################################
+
+use Socket;
+use Data::Dumper;
+use POSIX qw(:signal_h :sys_wait_h);
+use Config::ContextSensitive qw(:macros);
+
+##############################################################################################
+
+use api::base;
+use api::util::lru;
+use api::util::event;
+
+##############################################################################################
+#                    P R E - C O N F I G U R A T I O N   D E F A U L T S
+##############################################################################################
+
+my %DEFAULTS = (
+    'configfile'		=> "/opt/openlb/etc/openlb.conf",
+    'configdir'			=> "/opt/openlb/etc",
+);
+
+##############################################################################################
+#                       C O N F I G U R A T I O N   T E M P L A T E
+##############################################################################################
+
+my $CONF_TEMPLATE = SECTION(
+    HIDDEN('configdir', ARG(CF_PATH, STORE(TO 'CONFIG', KEY 'configdir'), DEFAULT $SYSCONFDIR)),
+    DIRECTIVE('pidfile', ARG(CF_PATH, STORE(TO 'CONFIG', KEY 'pidfile'), DEFAULT $LOCALSTATEDIR."/run/$COMMAND.pid")),
+    DIRECTIVE('log_to_syslog', ARG(CF_BOOLEAN, STORE(TO 'CONFIG', KEY 'log_to_syslog'), DEFAULT '1')),
+    DIRECTIVE('log_to_console', ARG(CF_BOOLEAN, STORE(TO 'CONFIG', KEY 'log_to_console'), DEFAULT '0')),
+    DIRECTIVE('syslog_facility', MAP(FROM 'LOG_FACILITIES', STORE(TO 'CONFIG', KEY 'syslog_facility'), DEFAULT 'daemon')),
+    DIRECTIVE('syslog_level', MAP(FROM 'LOG_LEVELS', STORE(TO 'CONFIG', KEY 'syslog_level'), DEFAULT 'info')),
+    DIRECTIVE('update_interval', ARG(CF_INTEGER, STORE(TO 'CONFIG', KEY 'update_interval'), DEFAULT '10')),
+    DIRECTIVE('method_timeout', ARG(CF_INTEGER|CF_POSITIVE, STORE(TO 'CONFIG', KEY 'method_timeout'), DEFAULT '10')),
+    DIRECTIVE('module_timeout', ARG(CF_INTEGER|CF_POSITIVE, STORE(TO 'CONFIG', KEY 'module_timeout'), DEFAULT '60')),
+    DIRECTIVE('max_respawn_delay', ARG(CF_INTEGER|CF_POSITIVE, STORE(TO 'CONFIG', KEY 'max_respawn_delay'), DEFAULT '60')),
+    DIRECTIVE('load_balancer', SECTION_NAME, SECTION(
+	DIRECTIVE('update_interval', ARG(CF_INTEGER, STORE(TO 'LOADBALANCER', KEY { '$SECTION' => { 'update_interval' => '$VALUE' } }))),
+	DIRECTIVE('tie_breaker', MAP(FROM 'TIE_BREAKERS', STORE(TO 'LOADBALANCER', KEY { '$SECTION' => { 'tie_breaker' => '$VALUE' } }))),
+	DIRECTIVE('input', SKIP, REQUIRE(DIRECTIVE('weight', ARG(CF_INTEGER, STORE(TO 'LOADBALANCER', KEY { '$SECTION' => { 'input' => { '$ARG[1]' => { 'weight' => '$VALUE' } } } }))))),
+	DIRECTIVE('output', ARG(CF_ARRAY|CF_STRING, STORE(TO 'LOADBALANCER', KEY { '$SECTION' => { 'output' => ['$VALUES'] } })))
+    )),
+    DIRECTIVE('module', ARG(CF_STRING|CF_SECTION, POSTPARSER &load_module),
+			  ARG(CF_STRING|CF_SECTION_NAME, STORE(TO 'MODULE', KEY { '$NESTED_SECTION' => { 'instance' => '$VALUE' } })),
+			  ARG(CF_NONE, STORE(TO 'MODULE', KEY { '$NESTED_SECTION' => { 'type' => '$ARG[1]' } })))
+);
+
+##############################################################################################
+#                                     C O N S T A N T S
+##############################################################################################
+
+# Known syslog facilities
+our %LOG_FACILITIES = (
+    'auth'				=> 'LOG_AUTH',
+    'authpriv'				=> 'LOG_AUTHPRIV',
+    'cron'				=> 'LOG_CRON',
+    'daemon'				=> 'LOG_DAEMON',
+    'ftp'				=> 'LOG_FTP',
+    'kern'				=> 'LOG_KERN',
+    'lpr'				=> 'LOG_LPR',
+    'mail'				=> 'LOG_MAIL',
+    'news'				=> 'LOG_NEWS',
+    'syslog'				=> 'LOG_SYSLOG',
+    'user'				=> 'LOG_USER',
+    'uucp'				=> 'LOG_UUCP',
+    'local0'				=> 'LOG_LOCAL0',
+    'local1'				=> 'LOG_LOCAL1',
+    'local2'				=> 'LOG_LOCAL2',
+    'local3'				=> 'LOG_LOCAL3',
+    'local4'				=> 'LOG_LOCAL4',
+    'local5'				=> 'LOG_LOCAL5',
+    'local6'				=> 'LOG_LOCAL6',
+    'local7'				=> 'LOG_LOCAL7'
+);
+
+# Known syslog levels
+our %LOG_LEVELS = (
+    'emergency'				=> 'LOG_EMERG',
+    'alert'				=> 'LOG_ALERT',
+    'critical'				=> 'LOG_CRIT',
+    'error'				=> 'LOG_ERR',
+    'warning'				=> 'LOG_WARNING',
+    'notice'				=> 'LOG_NOTICE',
+    'info'				=> 'LOG_INFO',
+    'debug'				=> 'LOG_DEBUG'
+);
+
+# Known load balancer fallback tie breakers
+use constant {
+    LB_TIE_BREAKER_ROUND_ROBIN		=> 1
+};
+our %TIE_BREAKERS = (
+    'round-robin'			=> &LB_TIE_BREAKER_ROUND_ROBIN
+);
+
+# Internal private storage keys
+use constant {
+    MAIN_PROC_DATA			=> '___priv|_main_proc_data_',
+    CHILD_PROC_DATA			=> '___priv|_child_proc_data_'
+};
+
+my $USAGE = $COMMAND." [config file] start|stop|reload|restart|status|dontfork\n";
+
+##############################################################################################
+#                                       G L O B A L S
+##############################################################################################
+
+our (%CONFIG, %MODULE, %LOADBALANCER);
+
+our ($API, $EVMON);
+
+our %CHILD_PROC;
+our %MOD_RUNNING;
+our %LB_RUNNING;
+our $REQUIRED;
+
+our @INPUT_QUEUE;
+
+##############################################################################################
+#                            C O D E   ' E N T R Y   P O I N T '
+##############################################################################################
+
+# Quit if we have wrong number of arguments
+unless($#ARGV+1 == 1 || $#ARGV+1 == 2) {
+    die $USAGE;
+}
+
+%CONFIG = ();
+%MODULE = ();
+%LOADBALANCER = ();
+
+my $CONFIGFILE = $DEFAULTS{'configfile'};
+
+# First argument (if more than one) is a config file name
+if($#ARGV+1 == 2) {
+    my $arg = shift @ARGV;
+    if(-f $arg) {
+	$CONFIGFILE = $arg;
+    } elsif(-d $DEFAULTS{'configdir'}) {
+	$CONFIGFILE = $DEFAULTS{'configdir'} . "/$arg";
+    }
+}
+
+# Create config template object
+our $CONF = Config::ContextSensitive->new($CONF_TEMPLATE)
+    or die "Failed to initialize configuraton template\n";
+
+# Assign hashes to named configuration destinations
+$CONF->assign_destination('CONFIG', \%CONFIG);
+$CONF->assign_destination('MODULE', \%MODULE);
+$CONF->assign_destination('LOADBALANCER', \%LOADBALANCER);
+
+# Load configuration file
+$CONF->load($CONFIGFILE)
+    or die "Failed to load configuration file ".$CONFIGFILE."\n";
+
+##############################################################################################
+#                C O M M A N D   L I N E   A R G U M E N T   P A R S E R
+##############################################################################################
+
+my $arg = shift @ARGV;
+
+if($arg =~ /^start$/i) {
+
+    # Start the daemon
+    &start_openlb();
+
+} elsif($arg =~ /^stop$/i) {
+
+    # Stop the daemon
+    &stop_openlb();
+
+} elsif($arg =~ /^reload$/i) {
+
+    # HUP the daemon
+    &reload_openlb();
+
+} elsif($arg =~ /^restart$/i) {
+
+    # Restart the daemon
+    if(&stop_openlb()) {
+	&start_openlb();
+    }
+
+} elsif($arg =~ /^status$/i) {
+
+    # Check if daemon is running
+    unless(&status_openlb()) {
+	exit(1);
+    }
+
+} elsif($arg =~ /^dontfork$/i) {
+
+    # Start the daemon in foreground
+    $CONFIG{'foreground'} = 1;
+    &openlb_main();
+
+} else {
+
+    # Spit the usage line out
+    die $USAGE;
+
+}
+
+exit(0);
+
+##############################################################################################
+#                C O M M A N D   L I N E   A C T I O N   F U N C T I O N S
+##############################################################################################
+
+
+sub start_openlb() {
+    my $pidfd;
+    my $pid;
+
+    print STDERR $COMMAND." starting ... ";
+
+    # Check if we are already running
+    $pid = get_pid();
+    if(defined($pid)) {
+	# If process is already running, don't bother ....
+	if(is_process($pid)) {
+	    print STDERR "already running\n";
+	    return 0;
+	}
+	# Remove stale PID file and continue
+	unlink($CONFIG{'pidfile'});
+	print STDERR "removed stale PID file ... ";
+    }
+
+    # Launch main daemon into background    
+    $pid = fork();
+
+    # Return error if fork() failed
+    return 0 unless($pid > -1);
+
+    if($pid > 0) {
+	# Write child PID into pid file
+	if(open($pidfd, ">".$CONFIG{'pidfile'})) {
+	    print $pidfd $pid;
+	    close($pidfd);
+	} else {
+	    print STDERR "failed to save PID ... ";
+	}
+	print STDERR "done\n";
+	return 1;
+    }
+
+    ## MAIN CODE
+
+    openlb_main();
+
+    exit(0);
+}
+
+sub stop_openlb() {
+    print STDERR $COMMAND." stopping ... ";
+
+    # Try graceful termination first
+    my $pid = signal_openlb('TERM');
+    unless(defined($pid)) {
+	print STDERR "not running\n";
+	return 0;
+    }
+
+    # Begin graceful termination timeout
+    my $timeout = 10;
+    # Keep looping until process is gone ...
+    while(is_process($pid)) {
+	# ... or timer has expired
+	unless($timeout--) {
+	    # ... then kill the process brutally.
+	    kill 'KILL', $pid;
+	    last;
+	}
+	# Until then, sleep one second
+	sleep(1);
+    }
+
+    print STDERR "done\n";
+    return 1;
+}
+
+sub reload_openlb() {
+    print STDERR $COMMAND." reloading ... ";
+
+    unless(signal_openlb('HUP')) {
+	print STDERR "not running\n";
+	return 0;
+    }
+
+    print STDERR "done\n";
+    return 1;
+}
+
+sub status_openlb() {
+    # Get PID from PID file
+    my $pid = get_pid();
+
+    # Is process running ?
+    if(defined($pid) && is_process($pid)) {
+	# This is for Heartbeat LBS script compliance
+	print STDOUT "OK\n";
+	return 1;
+    }
+    return 0;
+}
+
+sub signal_openlb() {
+    my $sig = shift;
+
+    # Get PID from PID file
+    my $pid = get_pid();
+
+    # If process is not running, don't bother ....
+    unless(defined($pid) && is_process($pid)) {
+	# Remove stale PID file
+	unlink($CONFIG{'pidfile'});
+	# Report failure
+	return undef;
+    }
+
+    # Signal process
+    kill $sig, $pid;
+
+    return $pid;
+}
+
+##############################################################################################
+#                                      M A I N   C O D E
+##############################################################################################
+
+sub openlb_main() {
+
+    %CHILD_PROC = ();
+    %MOD_RUNNING = ();
+    %LB_RUNNING = ();
+
+    @INPUT_QUEUE = ();
+
+    # Create our own API object
+    # to be passed to modules
+    $API = api::base->new(\%CONFIG);
+    if(defined($API)) {
+	# Initialize event engine
+	$EVMON = api::util::event->new();
+	if(defined($EVMON)) {
+
+	    $0 = $COMMAND." [main using configuration file ".$CONFIGFILE."]";
+	    $API->logging('LOG_INFO', "OpenLB v%s starting [using configuration file %s]",
+				      $VERSION,
+				      $CONFIGFILE);
+
+	    # If syslog level is debug, dump entire config
+	    $API->logging('LOG_DEBUG', $CONF->show_config());
+
+	    # Disable these signals
+	    $SIG{INT} =
+	    $SIG{TERM} =
+	    $SIG{PIPE} =
+	    $SIG{CHLD} =
+	    $SIG{ALRM} =
+	    $SIG{WINCH} = 'IGNORE';
+
+	    # Register termination event to make a clean exit
+	    $EVMON->create_termination_event('handler' => \&terminate_all);
+	    # Register reaping event to cleanup after child processes
+	    $EVMON->create_reaping_event('handler' => \&reap_child);
+	    # Register reload event to reload the configuration
+	    $EVMON->create_reload_event('handler' => \&reinitialize);
+
+	    # Initialize module instances and load balancers
+	    if(initialize()) {
+
+		# This is the main loop that:
+		#
+		#  - respawns child processes
+		#  - receives keepalives from child processes
+		#  - hunts for non responsive child processes
+		#  - receives data from input modules
+		#  - runs load balancer algorithms
+		#  - sends load balancers' data to output modules
+		#
+		while(!$EVMON->stopped()) {
+		    # Poll for events
+		    my @handlers = $EVMON->poll();
+		    # On event, invoke callbacks for all triggered events
+		    for(my $handler = shift @handlers;
+			!$EVMON->stopped() && defined($handler);
+			$handler = shift @handlers) {
+			# Handler must return whatever evaluates to true
+			unless($handler->()) {
+			    # Stop event engine
+			    $EVMON->stop();
+			}
+		    }
+		}
+
+	    }
+	    # Terminate all child processes
+	    terminate_children();
+	}
+    }
+
+    # Delete the PID file
+    if(-f $CONFIG{'pidfile'}) {
+	unlink($CONFIG{'pidfile'});
+    }
+
+    $API->logging('LOG_INFO', "OpenLB v%s ended",
+			      $VERSION);
+
+    return;
+}
+#
+# Receive input from a module instance
+#
+#  This function is used as a read event handler for each
+#  of module instances. When a module instance attempts
+#  to deliver data to the main process, this function
+#  is invoked to receive it. Data is received at a max
+#  rate of 100 messages per run. Received data is put
+#  into the input queue and processed whenever the main
+#  process is not doing anything else.
+#
+#   Input:	1. input channel's file handle
+#		2. module instance's child process's PID
+#
+#   Output:	1. TRUE, if succeeded
+#		2. FALSE, if failed
+#
+sub receive_input($$) {
+    my ($handle, $pid) = @_;
+
+    # Determine sending instance
+    my $instance = $CHILD_PROC{$pid};
+
+    # Can't receive without input channel. If it's not there,
+    # it was closed by reap_child() invoked by SIGCHILD handler
+    # as a result of a child process dying or being explicitly
+    # killed internally by watcher or externaly, by user.
+    unless(defined($instance->{MAIN_PROC_DATA}{'channel'})) {
+	# Do some debug logging
+	$API->logging('LOG_DEBUG', "Module %s instance %s is missing the communication channel",
+				   $instance->{'type'},
+				   $instance->{'instance'});
+	return 1;
+    }
+
+    my $num_received;
+
+    # Receive max. 100 messages at a time
+    for($num_received = 0; $num_received < 100; $num_received++) {
+	# Read input from module's instance
+	my @data = $API->get_args($instance->{MAIN_PROC_DATA}{'channel'});
+	# If nothing was received,
+	# we are done for now
+	last unless(scalar(@data) > 0);
+
+	# First element should be message type
+	my $message = shift @data;
+	# Skip if we received garbage
+	unless(defined($message) && $message ne '') {
+	    # Do some debug logging
+	    $API->logging('LOG_DEBUG', "Received garbage from %s module instance %s",
+				       $instance->{'type'},
+				       $instance->{'instance'});
+	    last;
+	}
+
+	# Did we receive a data record message ?
+	if($instance->is_record($message)) {
+	    # Immediately following the message type
+	    # should be the node's status
+	    my $status = shift @data;
+	    # Immediately following the node's status
+	    # should be the input's IPv4 address and
+	    # immadiataly after that the IPv6 address.
+	    $instance->{MAIN_PROC_DATA}{'address'}{'ipv4'} = shift @data;
+	    $instance->{MAIN_PROC_DATA}{'address'}{'ipv6'} = shift @data;
+	    # Status of the node can be 'up' or 'down'
+	    # Node up ?
+	    if($instance->is_up($status)) {
+		# Node is up
+		$instance->{MAIN_PROC_DATA}{'status'} = 1;
+		# Any collected data ?
+		if(scalar(@data) && defined($data[0])) {
+		    # Store the rest of collected data
+		    $instance->{MAIN_PROC_DATA}{'data'} = \@data;
+		} else {
+		    # Do some debug logging
+		    $API->logging('LOG_DEBUG', "Received empty up message from %s module instance %s",
+					       $instance->{'type'},
+					       $instance->{'instance'});
+		}
+		# Mark the time of this update
+		$instance->{MAIN_PROC_DATA}{'last_update'} = time();
+	    # Node down ?
+	    } elsif($instance->is_down($status)) {
+		# Node is down
+		$instance->{MAIN_PROC_DATA}{'status'} = 0;
+		# No collected data
+		$instance->{MAIN_PROC_DATA}{'data'} = undef;
+		# Mark the time of this update
+		$instance->{MAIN_PROC_DATA}{'last_update'} = time();
+	    # We received unknown status
+	    } else {
+		# Do some debug logging
+		$API->logging('LOG_DEBUG', "Received unknown status %s from %s module instance %s: %s",
+					   $status,
+					   $instance->{'type'},
+					   $instance->{'instance'},
+					   join(',', @data));
+	    }
+	# Did we receive a keepalive ?
+	} elsif($instance->is_keepalive($message)) {
+	    # Do some debug logging
+	    $API->logging('LOG_DEBUG', "Received keepalive from %s module instance %s",
+				       $instance->{'type'},
+				       $instance->{'instance'});
+	# We received unknown message
+	} else {
+	    # Do some debug logging
+	    $API->logging('LOG_DEBUG', "Received unknown message %s from %s module instance %s: %s",
+				       $message,
+				       $instance->{'type'},
+				       $instance->{'instance'},
+				       join(',', @data));
+	}
+    }
+
+    # If we received at least one message ...
+    if($num_received > 0) {
+	# ... reset instance's watcher timeout
+	$EVMON->delay_event($instance->{MAIN_PROC_DATA}{'watcher'},
+			    $CONFIG{'module_timeout'});
+    }
+
+    return 1;
+}
+#
+# Send output to a module instance
+#
+#  This function is used as a write event handler for each
+#  of module instances. When a channel is ready to accept
+#  data from the main process to be delivered to a module
+#  instance, this function is invoked to send it. Data is
+#  taken from the output queue and sent at a max rate of
+#  100 messages per run. If the output queue is empty,
+#  this function will delay it's next run by one second.
+#
+#   Input:	1. output channel's file handle
+#		2. module instance's child process's PID
+#
+#   Output:	1. TRUE, if succeeded
+#		2. FALSE, if failed
+#
+sub send_output($$) {
+    my ($handle, $pid) = @_;
+
+    # Determine sending instance
+    my $instance = $CHILD_PROC{$pid};
+
+    # If queue is empty ...
+    unless(scalar(@{$instance->{MAIN_PROC_DATA}{'queue'}}) > 0) {
+	# ... delay our next run
+	$EVMON->delay_event($EVMON->{'write'}{fileno($handle)}, 1);
+	# ... do some debug logging
+	$API->logging('LOG_DEBUG', "Dispatcher: %s module instance %s record queue is empty: queue runner sleeping for 1 second",
+				   $instance->{'type'},
+				   $instance->{'instance'});
+	# ... and bail out
+	return 1;
+    }
+
+    # Deliver max. 100 queued messages at a time
+    for(1..100) {
+	# Get next queued message ...
+	my $data = shift @{$instance->{MAIN_PROC_DATA}{'queue'}};
+	# ... and, unless the output queue is empty ...
+	last unless(defined($data) && scalar(@{$data}) > 0);
+	# ... send it via instance's output channel
+	$API->put_args($instance->channel, $data);
+    }
+
+    return 1;
+}
+#
+# Sort input data by it's field values
+#
+#  This is the actual load balancing code. It is defined as a timer
+#  event handler invoked in regular intervals. Last received dataset
+#  from each configured input module's instance is compared against
+#  others and sorted by it's data fields in the descending order.
+#  Each dataset, aside from the mandatory status, contains zero or
+#  more module-specific data fields. Data fields are compared in
+#  the order of importance - more important fields (those reflecting
+#  more important aspects of device's state/health) are given first
+#  and, thus, compared first. Each field is compared to it's counterpart
+#  from another dataset only when there is a tie between fields that
+#  precede it. Optionally, if there is a tie across all datafields,
+#  round robin can ultimately be used as a tie-breaker.
+#
+#  Resulting sorted set will not contain the source data. Instead,
+#  each record in the set will only contain fields identifying
+#  the source device by name and IP address, the device's preference
+#  number and the sequence number of load balancer's current run.
+#
+#   Input:	1. timer event hashref
+#		2. load balancer's name
+#
+#   Output:	1. TRUE, if succeeded
+#		2. FALSE, if failed
+#
+sub load_balancer() {
+    my ($event, $lb_name) = @_;
+
+    # Get load balancer
+    my $lb = $LOADBALANCER{$lb_name};
+
+    my $num_inputs = keys %{$lb->{'input'}};
+    my $offset = $lb->{MAIN_PROC_DATA}{'seq_num'};
+    my $timestamp = time();
+
+    # Sort input data in ascending order
+    my @sorted = sort {
+
+	my $A = $MODULE{$a};
+	my $B = $MODULE{$b};
+
+	# The monitored device's status can be 'up' or 'down',
+	# which maps to TRUE or FALSE states, recpectively.
+	# In order for a device to be considered 'up', it's
+	# collector must have updated it's status in no more 
+	# than 3 times the load balancer's update interval
+	# and it's reported status MUST be defined.
+	#
+	# Thus, if the last collected data are older than
+	# 3 x update_interval or the status of the monitored
+	# device was not reported (yet), the device itself is
+	# considered 'down'.
+	my $status_a = (defined($A) &&
+			(defined($A->{MAIN_PROC_DATA}{'pid'}) && $A->{MAIN_PROC_DATA}{'pid'} > 0) &&
+			(defined($A->{MAIN_PROC_DATA}{'status'}) && $A->{MAIN_PROC_DATA}{'status'} != 0) &&
+			($timestamp - $A->{MAIN_PROC_DATA}{'last_update'} < 3 * $lb->{'update_interval'})) ? 1:0;
+
+	my $status_b = (defined($B) &&
+			(defined($B->{MAIN_PROC_DATA}{'pid'}) && $B->{MAIN_PROC_DATA}{'pid'} > 0) &&
+			(defined($B->{MAIN_PROC_DATA}{'status'}) && $B->{MAIN_PROC_DATA}{'status'} != 0) &&
+			($timestamp - $B->{MAIN_PROC_DATA}{'last_update'} < 3 * $lb->{'update_interval'})) ? 1:0;
+
+	# Weights must be greater or equal to 0
+	my $weight_a = $status_a * (($lb->{'input'}{$a}{'weight'} < 0) ? 0:$lb->{'input'}{$a}{'weight'});
+	my $weight_b = $status_b * (($lb->{'input'}{$b}{'weight'} < 0) ? 0:$lb->{'input'}{$b}{'weight'});
+
+	# Offsets for deriving rotary indexes
+	# for round-robin tie breaking
+	my $offset_a = $offset++;
+	my $offset_b = $offset;
+
+	# Push devices marked as 'down' to the tail ...
+	#
+	# Treat devices with weight 0
+	# the same way as if they were 'down'
+
+	# If $a is down while $b is not ...
+	if($weight_a == 0 && $weight_b > 0) {
+	    # ... report that $a is greater than $b,
+	    # even if it isn't, in order to push it
+	    # back, towards the tail.
+	    return 1;
+	# If $b is down while $a is not ...
+	} elsif($weight_a > 0 && $weight_b == 0) {
+	    # ... report that $b is greater than $a,
+	    # even if it isn't, in order to keep it
+	    # in the back.
+	    return -1;
+	# If both $a and $b are down ...
+	} elsif($weight_a == 0 && $weight_b == 0) {
+	    # ... report that $a and $b are equal.
+	    return 0;
+	}
+
+	# Loop through all data fields and compare them assuming they were
+	# defined and sorted in descending order of 'importance'. Thus,
+	# the first unequal pair of data fileds will be the tie breaker.
+	# In other words, the loop will keep going as long as data fields
+	# it compares are equal. If it reaches the end of the data set,
+	# it means that all data fields are equal, which, in turn, means
+	# that compared collectors $a and $b are effectively equal.
+	for(my $i = 0; $i < scalar(@{$A->{MAIN_PROC_DATA}{'data'}}); $i++) {
+	    # Skip undefined data
+	    next unless defined($A->{MAIN_PROC_DATA}{'data'}->[$i]) &&
+			defined($B->{MAIN_PROC_DATA}{'data'}->[$i]);
+	    # Compare same data fields from 2 different collectors
+	    my $res = ($A->{MAIN_PROC_DATA}{'data'}->[$i] / $weight_a) <=> ($B->{MAIN_PROC_DATA}{'data'}->[$i] / $weight_b);
+	    return $res if $res;
+	}
+
+	# Do we have a fallback tie breaker defined ?
+	if(defined($lb->{'tie_breaker'})) {
+	    # Fall back to round-robin when all data fields are equal
+	    if($lb->{'tie_breaker'} == LB_TIE_BREAKER_ROUND_ROBIN) {
+		# Compare rotary indexes virtually assigned to collectors
+		return ($offset_a % $num_inputs) <=> ($offset_b % $num_inputs);
+	    }
+	}
+
+	# Compared collectors $a and $b are equal
+	return 0;
+
+    } keys %{$lb->{'input'}};
+
+    $API->logging('LOG_NOTICE', "Load balancer %s sorted new set of collected data: %s",
+				 $lb_name,
+				 join(', ', @sorted));
+
+    # Queue data to be sent to a backend
+    my $preference = scalar(@sorted);
+    while(my $input_name = shift @sorted) {
+	# Get objref to the input module
+	my $input_instance = $MODULE{$input_name};
+	# Get input module's status and device IP addresses
+	my $input_status = $input_instance->{MAIN_PROC_DATA}{'status'};
+	my $input_ipv4 = $input_instance->{MAIN_PROC_DATA}{'address'}{'ipv4'};
+	my $input_ipv6 = $input_instance->{MAIN_PROC_DATA}{'address'}{'ipv6'};
+	# Format the record
+	my $record = $input_instance->record($lb_name,
+					     $lb->{MAIN_PROC_DATA}{'seq_num'},
+					     (
+						defined($input_status) && $input_status != 0 &&
+						defined($lb->{'input'}{$input_name}{'weight'}) &&
+						$lb->{'input'}{$input_name}{'weight'} > 0
+					     ) ? $preference:0,
+					     $input_name,
+					     defined($input_ipv4) ? $input_ipv4:'',
+					     defined($input_ipv6) ? $input_ipv6:'');
+	# Format load balancer's output record
+	# and queue it to all output instances
+	foreach my $output_name (@{$lb->{'output'}}) {
+	    # Get output module instance
+	    my $output_instance = $MODULE{$output_name};
+	    if(defined($output_instance)) {
+		# Queue the record
+		push @{$output_instance->{MAIN_PROC_DATA}{'queue'}}, $record;
+	    }
+	}
+	# Next node will have lower preference
+	$preference--;
+    }
+
+    # Keep the timestamp of the last update
+    $lb->{MAIN_PROC_DATA}{'last_update'} = $timestamp;
+
+    # Advance sequence number
+    $lb->{MAIN_PROC_DATA}{'seq_num'}++;
+
+    return 1;
+}
+#
+# Create module instance's child process
+#
+#  This function creates a child process for a module instance.
+#  It provides a pair of non blocking pipes for bidirectional
+#  communication between the main process and the instance's
+#  child process.
+#
+#  On the child process side, this function provides entire
+#  module framework. Methods defined by the module API and
+#  exported by modules are invoked by this framework at
+#  appropriate times. This function provides the glue code
+#  between those methods. It initializes module's instance,
+#  handles exit and cleanup, configuration reloads, signals,
+#  receives messages from and delivers messages to the main
+#  process, processes events registered by modules ...
+#
+#  Events within a single instance are serialized, multiplexed
+#  in time and processed by invoking their registered handlers
+#  from a run loop that sits at the core of this function.
+#  Because handlers are standalone, independent, self-contained
+#  callback functions, and because they are scheduled to run in
+#  undeterministic fashion, it creates a sense of parallelism,
+#  although nothing is really run concurrently within a single
+#  child process.
+#
+#   Input:	1. module instance's name
+#
+#   Output:	1. module instance objref
+#		2. undef, if failed
+#
+sub launch_module_instance($) {
+    my $instance_name = shift;
+    my ($module_fh, $main_fh);
+
+    my $instance = $MODULE{$instance_name};
+    unless(defined($instance)) {
+	$API->logging('LOG_ERR', "Failed to create %s module instance %s",
+				 $instance->{'type'},
+				 $instance_name);
+	return undef;
+    }
+
+    # Create bidirectional comm channels
+    socketpair($module_fh, $main_fh, AF_UNIX, SOCK_STREAM, PF_UNSPEC);
+
+    # Launch module into background
+    my $pid = fork();
+    return undef unless defined($pid);
+
+    # Update module data and return module object
+    if($pid > 0) {
+	close($module_fh);
+	$main_fh->autoflush(1);
+	$API->set_nonblocking($main_fh);
+	$instance->{MAIN_PROC_DATA}{'channel'} = $main_fh;
+	$instance->{MAIN_PROC_DATA}{'queue'} = [];
+	$instance->{MAIN_PROC_DATA}{'pid'} = $pid;
+	$instance->{MAIN_PROC_DATA}{'spawn_time'} = time();
+	return $instance;
+    }
+
+    ## Module process starts here
+
+    # Don't use these signals by default
+    $SIG{HUP} =
+    $SIG{INT} =
+    $SIG{TERM} =
+    $SIG{PIPE} =
+    $SIG{CHLD} =
+    $SIG{ALRM} =
+    $SIG{WINCH} = 'IGNORE';
+
+    # Clean up globals we inherited from
+    # main process we do not need
+    $EVMON->flush();
+    undef $EVMON;
+    undef $REQUIRED;
+    undef @INPUT_QUEUE;
+    undef %CHILD_PROC;
+    undef %MOD_RUNNING;
+    undef %LB_RUNNING;
+
+    # Clean up main process's instance-specific
+    # runtime data we do not need
+    delete $instance->{MAIN_PROC_DATA};
+    # We don't need main process's end of the pipe
+    close($main_fh);
+    # Setup and save our end of the pipe
+    $module_fh->autoflush(1);
+    $API->set_nonblocking($module_fh);
+    $instance->{CHILD_PROC_DATA}{'channel'} = $module_fh;
+
+    $0 = $COMMAND." [".$instance->{'type'}." module ".$instance_name."]";
+    $API->logging('LOG_INFO', "Module %s instance %s started",
+			      $instance->{'type'},
+			      $instance_name);
+
+    # Check if module implements these non-mandatory methods
+
+    my $method_daemonize = eval { $instance->can('daemonize'); };
+    undef $method_daemonize unless(defined($method_daemonize) &&
+				   ref($method_daemonize) eq 'CODE');
+
+    my $method_initialize = eval { $instance->can('initialize'); };
+    undef $method_initialize unless(defined($method_initialize) &&
+				    ref($method_initialize) eq 'CODE');
+
+    my $method_initialize_timeout = $instance->can('initialize_timeout');
+    undef $method_initialize_timeout unless(defined($method_initialize_timeout) &&
+					    ref($method_initialize_timeout) eq 'CODE');
+
+    my $method_reinitialize = eval { $instance->can('reinitialize'); };
+    undef $method_reinitialize unless(defined($method_reinitialize) &&
+				      ref($method_reinitialize) eq 'CODE');
+
+    my $method_reinitialize_timeout = eval { $instance->can('reinitialize_timeout'); };
+    undef $method_reinitialize_timeout unless(defined($method_reinitialize_timeout) &&
+					      ref($method_reinitialize_timeout) eq 'CODE');
+
+    my $method_process = eval { $instance->can('process'); };
+    undef $method_process unless(defined($method_process) &&
+				 ref($method_process) eq 'CODE');
+
+    my $method_process_timeout = eval { $instance->can('process_timeout'); };
+    undef $method_process_timeout unless(defined($method_process_timeout) &&
+					 ref($method_process_timeout) eq 'CODE');
+
+    my $method_host = eval { $instance->can('host'); };
+    undef $method_host unless(defined($method_host) &&
+			      ref($method_host) eq 'CODE');
+
+    my $method_host_timeout = eval { $instance->can('host_timeout'); };
+    undef $method_host_timeout unless(defined($method_host_timeout) &&
+				      ref($method_host_timeout) eq 'CODE');
+
+    my $method_abort = eval { $instance->can('abort'); };
+    undef $method_abort unless(defined($method_abort) &&
+			       ref($method_abort) eq 'CODE');
+
+    my $method_abort_timeout = eval { $instance->can('abort_timeout'); };
+    undef $method_abort_timeout unless(defined($method_abort_timeout) &&
+				       ref($method_abort_timeout) eq 'CODE');
+
+    my $method_cleanup = eval { $instance->can('cleanup'); };
+    undef $method_cleanup unless(defined($method_cleanup) &&
+				 ref($method_cleanup) eq 'CODE');
+
+    my $method_cleanup_timeout = eval { $instance->can('cleanup_timeout'); };
+    undef $method_cleanup_timeout unless(defined($method_cleanup_timeout) &&
+					 ref($method_cleanup_timeout) eq 'CODE');
+
+    # Create our own event monitor
+    $EVMON = api::util::event->new();
+
+    # Module specific internal data storage.
+    #
+    # Value returned by daemonize(), initialize()
+    # and reinitialize() is passed to other methods
+    # as internal data, transparent to OpenLB itself.
+    # Being module-specific, it can be any data of
+    # any type, but never undef.
+    my $instance_data;
+
+    # Do child process specific initialization
+    # like creating instance storage space and
+    # configuring internal instance parameters,
+    # like timeouts.
+    #
+    # DO NOT block inside this method !
+    #
+    if(defined($method_daemonize)) {
+	# Invoke daemonize() method
+	$instance_data = $EVMON->invoke_handler('handler' => $method_daemonize,
+						'args' => [ $instance ],
+						'attempts' => 1,
+						'timeout' => $CONFIG{'method_timeout'});
+	# Returned data must be defined() even if it is
+	# a simple boolean value. FALSE is also valid.
+	unless(defined($instance_data)) {
+	    $API->logging('LOG_ERR', "Module %s instance %s failed to configure it's child process",
+				     $instance->{'type'},
+				     $instance_name);
+	    die;
+	}
+    }
+
+    # By default, termination handler
+    # will only stop event processing
+    # which will terminate the child
+    # process.
+    my %term = ( 'handler' => sub { $EVMON->stop(); } );
+    # However, if module defines abort() method ...
+    if(defined($method_abort)) {
+	# Get abort() method attempts, if defined
+	my $attempts = $instance->get_abort_attempts();
+	# Get abort() method timeout, if defined
+	my $timeout = $instance->get_abort_timeout();
+	# Termination handler's input parameters
+	%term = ('handler' => sub {
+		    # Skip event hashref (implicit argument)
+		    shift;
+		    # Invoke abort() method
+		    $method_abort->(@_);
+		    # Explicitly return nothing
+		    return;
+		 },
+		 'args' => [ $instance, $instance_data ],
+		 'attempts' => defined($attempts) ? $attempts:1,
+		 'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+		 'on_timeout' => sub {
+			# Does module provide custom timeout handler ?
+			if(defined($method_abort_timeout)) {
+			    # Invoke module specific timeout handler
+			    $method_abort_timeout->(@_);
+			} else {
+			    # Generic method timeout report
+			    $API->logging('LOG_WARNING', "Module %s instance %s: abort() timed out",
+							 $instance->{'type'},
+							 $instance_name);
+			}
+			# Explicitly return nothing
+			return;
+		 });
+    }
+    # Create termination event to exit
+    # upon receiving SIGTERM or SIGINT
+    $EVMON->create_termination_event(%term);
+
+    # Do all neccessary preparations, if required
+    if(defined($method_initialize)) {
+	# Get initialize() method attempts, if defined
+	my $attempts = $instance->get_initialize_attempts();
+	# Get initialize() method timeout, if defined
+	my $timeout = $instance->get_initialize_timeout();
+	# Run initialize() in a controlled environment
+	my $init_result = $EVMON->invoke_handler('handler' => sub {
+						    # Invoke initialize() method.
+						    my $new_data = $method_initialize->(@_);
+						    # Returned data must be defined() even if it is
+						    # a simple boolean value. FALSE is also valid,
+						    # but not undef !
+						    if(defined($new_data)) {
+							# Data returned by initialize()
+							# is our new instance data
+							$instance_data = $new_data;
+							return 1;
+						    }
+						    # Initialize failed
+						    return 0;
+						 },
+						 'args' => [ $instance, $instance_data ],
+						 'attempts' => defined($attempts) ? $attempts:1,
+						 'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+						 'on_timeout' => sub {
+							# Does module provide custom timeout handler ?
+							if(defined($method_initialize_timeout)) {
+							    # Invoke module specific timeout handler
+							    my $new_data = $method_initialize_timeout->(@_);
+							    # If timeout handler returns data, treat them
+							    # as if they were returned by the initialize()
+							    # itself. Otherwise, assume the module handled
+							    # the timeout without trying to fix anything
+							    # (which is perfectly legal).
+							    if(defined($new_data)) {
+								# Data returned by timeout handler
+								# is our new instance data
+								$instance_data = $new_data;
+							    }
+							} else {
+							    # Generic method timeout report
+							    $API->logging('LOG_WARNING', "Module %s: initialize() timed out",
+											 $instance_name);
+							}
+							# Timeout handler always succeeds
+							return 1;
+						 });
+	# initialize() method must succeed
+	unless($init_result) {
+	    $API->logging('LOG_ERR', "Module instance %s failed to initialize",
+				     $instance_name);
+	    die;
+	}
+    }
+
+    # This array will act as a buffer for
+    # records received from the main process
+    my @IN_RECORDS = ();
+    # This array will act as a buffer for
+    # records to be sent to the main process
+    my @OUT_RECORDS = ();
+
+    # Does module implement method process() ?
+    if(defined($method_process)) {
+	# Get process() method attempts, if defined
+	my $attempts = $instance->get_process_attempts();
+	# Get process() method timeout, if defined
+	my $timeout = $instance->get_process_timeout();
+	# Register queue runner callback that will be
+	# grabbing records from input queue and passing
+	# them to module's process() method. If process()
+	# produces a record, it will be put into module's
+	# output queue.
+	$EVMON->create_recurring_event('handler' => sub {
+					    my $event = shift;
+					    # If queue is empty ...
+					    unless(@IN_RECORDS) {
+						# ... sleep for a while
+						$EVMON->delay_event($event, 1);
+						# ... do some debug logging
+						$API->logging('LOG_DEBUG', "Module %s instance %s: record queue is empty: queue runner sleeping for 1 second",
+									   $instance->{'type'},
+									   $instance_name);
+						# ... and bail out
+						return;
+					    }
+					    # Invoke main module code without removing
+					    # record from the queue. We do this to allow
+					    # process_timeout() to pick the same record
+					    # from the queue in case process() times out.
+					    my @data = $method_process->($instance,
+									 $instance_data,
+									 @{$IN_RECORDS[0]});
+					    # If process() produced new data record ...
+					    if(scalar(@data) && defined($data[0])) {
+						# ... queue it for later delivery
+						# to the main process
+						push @OUT_RECORDS, \@data;
+					    }
+					    # Now we can safely remove the first record
+					    shift @IN_RECORDS;
+					    # Explicitly return nothing
+					    return;
+					},
+					'attempts' => defined($attempts) ? $attempts:1,
+					'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+					'on_timeout' => sub {
+					    # Does module provide custom timeout handler ?
+					    if(defined($method_process_timeout)) {
+						my $record = shift @IN_RECORDS;
+						# Invoke module specific timeout handler
+						my @data = $method_process_timeout->($instance,
+										     $instance_data,
+										     @{$record});
+						# If process_timeout() produced new data ...
+						if(scalar(@data) && defined($data[0])) {
+						    # ... queue it for later delivery
+						    # to the main process
+						    push @OUT_RECORDS, \@data;
+						}
+					    } else {
+						# Generic process() method timeout report
+						$API->logging('LOG_WARNING', "Module %s instance %s: process() timed out",
+									     $instance->{'type'},
+									     $instance_name);
+					    }
+					    # Explicitly return nothing
+					    return;
+					});
+    }
+
+    # Unless module already registered
+    # it's own input method ...
+    unless($EVMON->get_event($module_fh, 'r')) {
+	# ... register default input method
+	$EVMON->create_io_event('file' => $module_fh,
+				'op' => 'r',
+				'handler' => sub {
+				    # Process max. 100 messages at a time
+				    for(1..100) {
+					# Grab incoming record ...
+					my @data = $API->get_args($module_fh);
+					last unless(@data);
+					# Get message type
+					my $message = shift @data;
+					# Did we receive a data record ?
+					if($instance->is_record($message)) {
+					    # Does module implement method process() ?
+					    unless(defined($method_process)) {
+						# Do some debug logging
+						$API->logging('LOG_DEBUG', "Module %s instance %s is receiving data but doesn't implement process() method: record discarded",
+									   $instance->{'type'},
+									   $instance->{'instance'});
+						return;
+					    }
+					    # Do we have a proper data record ?
+					    if(scalar(@data) && defined($data[0])) {
+						# Queue received record for later processing
+						push @IN_RECORDS, \@data;
+					    } else {
+						# Do some debug logging
+						$API->logging('LOG_DEBUG', "Module %s instance %s received an empty record from the main process",
+									   $instance->{'type'},
+									   $instance->{'instance'});
+					    }
+					# Did we receive config message ?
+					} elsif($instance->is_config($message)) {
+					    # Config message must be complete
+					    unless(scalar(@data) == 2 && $data[0] ne '' && $data[1] ne '') {
+						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received incomplete configuration from main process",
+									 $instance->{'type'},
+									 $instance->{'instance'});
+						return;
+					    }
+					    # De-serialize global configuration
+					    my $new_api = eval($data[0]);
+					    unless(defined($new_api) && ref($new_api) eq ref($API)) {
+						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received invalid global configuration from main process",
+									 $instance->{'type'},
+									 $instance->{'instance'});
+						return;
+					    }
+					    # Replace current global config with new one
+					    $API = $new_api;
+					    # De-serialize instance configuration
+					    my $new_instance = eval($data[1]);
+					    unless(defined($new_instance) && ref($new_instance) eq ref($instance)) {
+						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received invalid instance configuration from main process",
+									 $instance->{'type'},
+									 $instance->{'instance'});
+						return;
+					    }
+					    # Even though we don't really need to instantiate
+					    # newly received configuration because Data::Dumper
+					    # already made sure we get the object of the same
+					    # class when deserializing, we will invoke instantiate()
+					    # in case module performs some specific init within.
+					    $new_instance = ref($instance)->instantiate($new_instance);
+					    unless(defined($new_instance) && ref($new_instance) eq ref($instance)) {
+						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: instantiate() failed",
+									 $instance->{'type'},
+									 $instance->{'instance'});
+						return;
+					    }
+					    # Copy instance specific child process data
+					    $new_instance->{CHILD_PROC_DATA} = $instance->{CHILD_PROC_DATA};
+					    # Replace current instance with new one
+					    $MODULE{$instance->{'instance'}} = $instance = $new_instance;
+					    # If module implements method for
+					    # reinitializing its internal data ...
+					    if(defined($method_reinitialize)) {
+						# Get reinitialize() method attempts, if defined
+						my $attempts = $instance->get_reinitialize_attempts();
+						# Get reinitialize() method timeout, if defined
+						my $timeout = $instance->get_reinitialize_timeout();
+						# Schedule as a recurring event, invoking it only once.
+						$EVMON->create_recurring_event('limit' => 1,
+									       'handler' => sub {
+										    # Skip event hashref (implicit argument)
+										    shift;
+										    # Invoke reinitialize() method
+										    my $new_data = $method_reinitialize->(@_);
+										    # Returned data must be defined() even if it is
+										    # a simple boolean value. FALSE is also valid,
+										    # but not undef !
+										    if(defined($new_data)) {
+											# Replace instance-specific data with
+											# whatever data method returned ...
+											$instance_data = $new_data;
+										    # Otherwise, undef is the sign of failure
+										    } else {
+											$API->logging('LOG_ERR', "Module %s instance %s failed to reinitialize",
+														 $instance->{'type'},
+														 $instance_name);
+										    }
+										    # Explicitly return nothing
+										    return;
+									       },
+									       'args' => [ $instance, $instance_data ],
+									       'attempts' => defined($attempts) ? $attempts:1,
+									       'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+									       'on_timeout' => sub {
+										    # Skip event hashref (implicit argument)
+										    shift;
+										    # Does module provide a custom timeout handler ?
+										    if(defined($method_reinitialize_timeout)) {
+											# Invoke module specific timeout handler
+											my $new_data = $method_reinitialize_timeout->(@_);
+											# If timeout handler returns data, treat them
+											# as if they were returned by the reinitialize()
+											# itself. Otherwise, assume the module handled
+											# the timeout without trying to fix anything
+											# (which is perfectly legal).
+											if(defined($new_data)) {
+											    # Replace instance-specific data with
+											    # whatever data method returned ...
+											    $instance_data = $new_data;
+											}
+										    } else {
+											# Generic method timeout report
+											$API->logging('LOG_WARNING', "Module %s instance %s: reinitialize() timed out",
+														     $instance->{'type'},
+														     $instance_name);
+										    }
+										    # Explicitly return nothing
+										    return;
+									       });
+					    }
+					    # Log success
+					    $API->logging('LOG_DEBUG', "Module %s instance %s reconfigured: replaced active configuration with one received from main process",
+								       $instance->{'type'},
+								       $instance->{'instance'});
+					} else {
+					    # Log unknown message
+					    $API->logging('LOG_WARNING', "Module %s instance %s: received unknown message from the main process",
+									 $instance->{'type'},
+									 $instance->{'instance'});
+					}
+				    }
+				    # Explicitly return nothing
+				    return;
+				});
+    }
+
+    # Unless module already registered
+    # it's own output method ...
+    unless($EVMON->get_event($module_fh, 'w')) {
+	# ... register default output method
+	$EVMON->create_io_event('file' => $module_fh,
+				'op' => 'w',
+				'handler' => sub {
+				    # If queue is empty ...
+				    unless(@OUT_RECORDS) {
+					# ... delay our next run
+					$EVMON->delay_event($EVMON->get_event($module_fh, 'w'), 1);
+					# ... do some debug logging
+					$API->logging('LOG_DEBUG', "Module %s instance %s: record queue is empty: queue runner sleeping for 1 second",
+								   $instance->{'type'},
+								   $instance_name);
+					# ... and bail out
+					return;
+				    }
+				    # Addresses provided by host() method
+				    my ($ipv4, $ipv6);
+				    # Does module implement method host() ?
+				    if(defined($method_host)) {
+					# Get host() method attempts, if defined
+					my $attempts = $instance->get_host_attempts();
+					# Get host() method timeout, if defined
+					my $timeout = $instance->get_host_timeout();
+					# Invoke host() method
+					($ipv4, $ipv6) = $EVMON->invoke_handler('handler' => $method_host,
+										'args' => [ $instance, $instance_data ],
+										'attempts' => defined($attempts) ? $attempts:1,
+										'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+										'on_timeout' => sub {
+											# Does module provide custom timeout handler ?
+											if(defined($method_host_timeout)) {
+											    # Invoke module specific timeout handler
+											    return $method_host_timeout->(@_);
+											} else {
+											    # Generic method timeout report
+											    $API->logging('LOG_WARNING', "Module %s instance %s: host() timed out",
+															 $instance->{'type'},
+															 $instance_name);
+											    return ();
+											}
+										});
+				    }
+				    for(1..100) {
+					# Get first queued record ...
+					my $record = shift @OUT_RECORDS;
+					last unless(defined($record) && scalar(@{$record}) > 0);
+					# ... look for node status
+					my $first_field = shift @{$record};
+					# If node status is defined, it's a node status record
+					if($instance->is_up($first_field) ||
+					   $instance->is_down($first_field)) {
+					    # Insert node's IPv4 and IPv6 addresses
+					    # to the beginning of the status record
+					    unshift @{$record}, defined($ipv6) ? $ipv6:'';
+					    unshift @{$record}, defined($ipv4) ? $ipv4:'';
+					}
+					# Put what we examined looking for node status
+					# back to the beginning of the data record
+					unshift @{$record}, $first_field;
+					# Deliver the record to the main process
+					$instance->put_record($record);
+				    }
+				    # Explicitly return nothing
+				    return;
+				});
+    }
+
+    # Create periodic event that will
+    # send keepalives every second
+    $EVMON->create_timer_event('interval' => 1,
+			       'handler' => sub {
+				    # Send keepalive
+				    $instance->put_keepalive;
+				    # Do some debug logging
+				    $API->logging('LOG_DEBUG', "Module %s instance %s sent keepalive",
+							       $instance->{'type'},
+							       $instance_name);
+				    # Explicitly return nothing
+				    return;
+			       });
+
+    # Multiplex input from parent process
+    # and registered file handles
+    while(!$EVMON->stopped()) {
+
+	# Poll for events
+	my @handlers = $EVMON->poll();
+	# On event, invoke callbacks for all triggered events
+	for(my $handler = shift @handlers;
+	    !$EVMON->stopped() && defined($handler);
+	    $handler = shift @handlers) {
+	    # If callback returns data, deliver it to the load balancer.
+	    # If no event is received in current time slice or invoked
+	    # callback doesn't return anything, do nothing.
+	    my @data = $handler->();
+	    # If we received new data ...
+	    if(scalar(@data) && defined($data[0])) {
+		# ... queue record for later delivery
+		# to the main process
+		push @OUT_RECORDS, \@data;
+	    }
+	}
+
+    }
+
+    # Do all neccessary cleanup, if required
+    if(defined($method_cleanup)) {
+	# Get cleanup() method attempts, if defined
+	my $attempts = $instance->get_cleanup_attempts();
+	# Get cleanup() method timeout, if defined
+	my $timeout = $instance->get_cleanup_timeout();
+	# Invoke cleanup() method.
+	$EVMON->invoke_handler('handler' => $method_cleanup,
+			       'args' => [ $instance, $instance_data ],
+			       'attempts' => defined($attempts) ? $attempts:1,
+			       'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+			       'on_timeout' => sub {
+				    # Does module provide custom timeout handler ?
+				    if(defined($method_cleanup_timeout)) {
+					# Invoke module specific timeout handler
+					$method_cleanup_timeout->(@_);
+				    } else {
+					# Generic method timeout report
+					$API->logging('LOG_WARNING', "Module %s instance %s: cleanup() timed out",
+								     $instance->{'type'},
+								     $instance_name);
+				    }
+			       });
+    }
+
+    $API->logging('LOG_INFO', "Module %s instance %s ended",
+			      $instance->{'type'},
+			      $instance_name);
+
+    exit(0);
+}
+#
+# Load module
+#
+#  This function is used as a postparser callback in
+#  configuration template. It is used by config parser
+#  to load a module, retrieve module's config template
+#  and pass it back to the config parser.
+#
+#  Input:	parameters that Config::ContextSensitive
+#		config parser passes to a postparser.
+#
+#  Output:	parameters that are passed back to
+#		Config::ContextSensitive config parser.
+#
+sub load_module($$$$$$$) {
+    my ($conf, $directive_name, $value, $dest_hash, $map_hash, $section, $nested_section) = @_;
+
+    # Module's name is passed by the config parser
+    # as $value parameter. The rest is ignored.
+    my $moduleclass = 'module::'.$value;
+
+    # Load module
+    eval 'use '.$moduleclass;
+    if(defined($@) && $@ ne "") {
+	print STDERR $@;
+	$API->logging('LOG_ERR', $@);
+	return 0;
+    }
+
+    # Modules must implement method register()
+    my $method_register = eval { $moduleclass->can('register'); };
+    unless(defined($method_register) &&
+	   ref($method_register) eq 'CODE') {
+	$API->logging('LOG_ERR', "Module %s is missing mandatory method register()",
+				 $value);
+	return 0;
+    }
+
+    # Modules must implement method instantiate()
+    my $method_instantiate = eval { $moduleclass->can('instantiate'); };
+    unless(defined($method_instantiate) &&
+	   ref($method_instantiate) eq 'CODE') {
+	$API->logging('LOG_ERR', "Module %s is missing constructor method instantiate()",
+				 $value);
+	return 0;
+    }
+
+    # Get module's configuration template
+    my $conf_template = $moduleclass->register();
+
+    return (1, $conf_template);
+}
+#
+# Spawn module instance's child process
+#
+#  This function takes instantiated module instance object
+#  and creates child process that does the actual processing.
+#  Main process registers event handlers for input from and
+#  output to the child process and a watchdog that restarts
+#  the child process if it stops sending keepalive messages.
+#
+#   Input:	1. event hashref
+#		2. module instance objref
+#
+#   Output:	1. TRUE, if successful
+#		   FALSE, if failed
+#
+sub spawn_child($$) {
+    my ($event, $instance) = @_;
+
+    # Skip init if this instance is running already
+    if(defined($instance->{MAIN_PROC_DATA}{'pid'})) {
+	return 1;
+    }
+
+    # Create module instance's child process
+    $instance = launch_module_instance($instance->{'instance'});
+    # If launch failed, report error and quit
+    unless(defined($instance)) {
+	$API->logging('LOG_ERR', "Failed to spawn %s module instance %s",
+				 $instance->{'type'},
+				 $instance->{'instance'});
+	return 0;
+    }
+
+    # Register watcher that will continuously monitor
+    # child process for hangs. Child is considered
+    # hanged if it fails to deliver at least one
+    # keepalive within specified timeout interval
+    $instance->{MAIN_PROC_DATA}{'watcher'} =
+	 $EVMON->create_timer_event('interval' => 1,
+				    'handler' => \&kill_child,
+				    'args' => [ $instance->{MAIN_PROC_DATA}{'pid'} ],
+				    'delay' => $CONFIG{'module_timeout'},
+				    'limit' => 1);
+
+    # Event handler for input from the child process
+    $EVMON->create_io_event('file' => $instance->{MAIN_PROC_DATA}{'channel'},
+			    'op' => 'r',
+			    'handler' => \&receive_input,
+			    'args' => [ $instance->{MAIN_PROC_DATA}{'pid'} ]);
+
+    # Event handler for output to the child process
+    $EVMON->create_io_event('file' => $instance->{MAIN_PROC_DATA}{'channel'},
+			    'op' => 'w',
+			    'handler' => \&send_output,
+			    'args' => [ $instance->{MAIN_PROC_DATA}{'pid'} ]);
+
+    # Add instance to the list of running instances
+    $MOD_RUNNING{$instance->{'instance'}} = $instance;
+    # Map instance's child process PID to instance itself
+    $CHILD_PROC{$instance->{MAIN_PROC_DATA}{'pid'}} = $instance;
+
+    return 1;
+}
+#
+# Stop module instance's child process
+#
+#  This function unconditionally stops the child process.
+#
+#   Input:	1. event hashref
+#		2. PID of the child process
+#
+#   Output:	1. TRUE, if successful
+#		   FALSE, if failed
+#
+sub kill_child($$) {
+    my ($event, $pid) = @_;
+
+    # Skip if this instance's PID is not known
+    return 1 unless defined($pid);
+
+    # Make a note in the log
+    $API->logging('LOG_WARNING', "Killing unresponsive child process [pid %d] for %s module instance %s",
+				 $pid,
+				 $CHILD_PROC{$pid}{'type'},
+				 $CHILD_PROC{$pid}{'instance'});
+
+    # Kill unresponsive child process
+    kill 'KILL', $pid;
+
+    return 1;
+}
+#
+# Reap a child process
+#
+#  This function collects terminated child process and
+#  cleans up after it. If global run state is still up,
+#  calculates cumulative backoff value and queues module
+#  instance the terminated child process belongs to for
+#  respawn, once the backoff interval has elapsed.
+#
+#   Input:	1. PID of the child process
+#
+#   Output:	nothing
+#
+sub reap_child($$) {
+    my ($event, $pid) = @_;
+
+    # Get module instance objref
+    my $instance = $CHILD_PROC{$pid};
+    return unless defined($instance);
+
+    my $instance_name = $instance->{'instance'};
+
+    # Close instance's comm channel
+    my $channel = $instance->{MAIN_PROC_DATA}{'channel'};
+    if(defined($channel)) {
+	# Destroy I/O events on channel
+	# that is about to be closed
+	$EVMON->destroy_io_event($channel, 'rw');
+	# Close channel
+	close($channel);
+	# Remove any trace of it
+	delete $instance->{MAIN_PROC_DATA}{'channel'};
+    }
+    # Remove instance's watcher event
+    $EVMON->destroy_timer_event($instance->{MAIN_PROC_DATA}{'watcher'});
+    # Remove reference to it
+    delete $instance->{MAIN_PROC_DATA}{'watcher'};
+
+    # Remove references to this child process
+    delete $MOD_RUNNING{$instance_name};
+    delete $CHILD_PROC{$pid};
+    delete $instance->{MAIN_PROC_DATA}{'pid'};
+
+    # Do some debug logging
+    $API->logging('LOG_DEBUG', "Module %s instance %s: child process [pid %d] terminated",
+			       $instance->{'type'},
+			       $instance_name,
+			       $pid);
+    # Should we respawn this child ?
+    if($EVMON->running() &&
+       defined($MODULE{$instance_name}) &&
+       defined($REQUIRED->{$instance_name})) {
+	# Calculate new backoff value
+	my $backoff = respawn_backoff($instance->{MAIN_PROC_DATA}{'backoff'},
+				      $instance->{MAIN_PROC_DATA}{'spawn_time'});
+	# Store new backoff value
+	$instance->{MAIN_PROC_DATA}{'backoff'} = $backoff;
+	# Queue child to be spawned in $backoff seconds
+	$EVMON->create_timer_event('interval' => $backoff,
+				   'handler' => \&spawn_child,
+				   'args' => [ $instance ],
+				   'delay' => $backoff,
+				   'limit' => 1);
+	# Do some debug logging
+	$API->logging('LOG_DEBUG', "Module %s instance %s: child process queued to be spawned in %d seconds",
+				   $instance->{'type'},
+				   $instance->{'instance'},
+				   $backoff);
+    }
+
+    return 1;
+}
+#
+# Build the list of instances required to run
+#
+#  This function compiles the list of instances referenced
+#  by load balancers either as input or output. Instances
+#  referenced by load balancers are required to run. Others
+#  will remain idle even if they exist in the configuration.
+#
+#  Instances referenced by load balancers must exist in
+#  the configuration. Otherwise, list creation fails.
+#
+#   Input:	1. module instances configuration hashref
+#		2. load balancers configuration hashref
+#
+#   Output:	1. required instances hashref
+#		   undef, if failed
+#
+sub get_required_instances($$) {
+    my ($instances, $loadbalancers) = @_;
+
+    my $required_instances = {};
+
+    # Make a list of module instances
+    # that are actually required to run
+    foreach my $lb_name (keys %{$loadbalancers}) {
+	# Get load balancer's configuration
+	my $lb = $loadbalancers->{$lb_name};
+	# Load balancer must have at least one input configured
+	unless(defined($lb->{'input'}) && keys %{$lb->{'input'}} > 0) {
+	    $API->logging('LOG_ERR', "Load balancer %s has no configured inputs",
+				     $lb_name);
+	    return undef;
+	}
+	# Load balancer must have at least one output configured
+	unless(defined($lb->{'output'}) && scalar(@{$lb->{'output'}}) > 0) {
+	    $API->logging('LOG_ERR', "Load balancer %s has no configured outputs",
+				     $lb_name);
+	    return undef;
+	}
+	# Prepare the list of module instances to
+	# be spawned. Instances not referenced by
+	# any load balancer don't need to run
+	foreach my $instance_name (keys %{$lb->{'input'}}, @{$lb->{'output'}}) {
+	    # Module instance referenced by load balancer
+	    # must exist in the configuration ...
+	    if(defined($instances->{$instance_name})) {
+		# Add instance to the list of instances that need to run.
+		# Each instance in the list will itself be a list of
+		# load balancers that require it
+		if(defined($required_instances->{$instance_name}) &&
+		   ref($required_instances->{$instance_name}) eq "ARRAY") {
+		    # If entry already exist in the list,
+		    # add referring load balancer to it
+		    push @{$required_instances->{$instance_name}}, $lb_name;
+		} else {
+		    # If entry doesn't exist in the list,
+		    # create it it and add load balancer
+		    $required_instances->{$instance_name} = [$lb_name];
+		}
+	    # Otherwise, if load balancer referenced
+	    # unknown instance - abort ...
+	    } else {
+		$API->logging('LOG_ERR', "Load balancer %s requires unknown module instance %s",
+					 $lb_name,
+					 $instance_name);
+		return undef;
+	    }
+	}
+    }
+
+    return $required_instances;
+}
+#
+# Instantiate modules
+#
+#  This fucnction creates module instances' objects
+#  from module instances' configuration hashes. Only
+#  instances in the list of required instances will
+#  be instatiated.
+#
+#   Input:	1. required instances hashref
+#		2. module instances configuration hashref
+#
+#   Output:	1. TRUE, if successful
+#		   FALSE, if failed
+#
+sub instantiate_modules($$) {
+    my ($required, $instances) = @_;
+
+    # Create new module instances
+    foreach my $instance_name (keys %{$instances}) {
+	# If module instance is in the list
+	# of instances required to run ...
+	if(defined($required->{$instance_name}) &&
+	   ref($required->{$instance_name}) eq "ARRAY") {
+	    # Get module instance's configuration
+	    my $conf = $instances->{$instance_name};
+	    # Invoke module's constructor to create instance
+	    my $module = 'module::'.$conf->{'type'};
+	    my $instance = $module->instantiate($conf);
+	    unless(defined($instance) && ref($instance) eq $module) {
+		$API->logging('LOG_ERR', "Failed to create %s module instance %s: instantiate() failed",
+					 $conf->{'type'},
+					 $instance_name);
+		return 0;
+	    }
+	}
+    }
+
+    return 1;
+}
+#
+# Start module instances' child processes
+#
+#  This function spawns child processes for module instances
+#  required to run. Only instances that are not already running
+#  will be started. Other configured instances will be left
+#  as they are at this point.
+#
+#   Input:	1. required instances hashref
+#		2. module instances configuration hashref
+#
+#   Output:	1. TRUE, if successful
+#		   FALSE, if failed
+#
+sub start_instances($$) {
+    my ($required, $instances) = @_;
+
+    # Create new module instances if they are
+    # required by load balancers to run ...
+    foreach my $instance_name (keys %{$instances}) {
+	# If module instance is in the list
+	# of instances required to run ...
+	if(defined($required->{$instance_name}) &&
+	   ref($required->{$instance_name}) eq "ARRAY") {
+	    # ... and it is not running already ...
+	    unless(defined($MOD_RUNNING{$instance_name})) {
+		# Instance to be spawned
+		my $instance = $instances->{$instance_name};
+		# Schedule instance's child process to be spawned
+		my $event = $EVMON->create_timer_event('interval' => 1,
+						       'handler' => \&spawn_child,
+						       'args' => [ $instance ],
+						       'limit' => 1);
+		# If scheduling failed ...
+		unless(defined($event)) {
+		    # ... make a note in the log
+		    $API->logging('LOG_ERR', "Failed to schedule %s module instance %s to be spawned",
+					     $instance->{'type'},
+					     $instance_name);
+		    # ... return error
+		    return 0;
+		}
+	    }
+	}
+    }
+
+    return 1;
+}
+#
+# Reconfigure running instances
+#
+#  This function identifies instances already up and running and
+#  reconfigures them by queueing the serialized configuration to
+#  be sent to instance's child process. Only instances required
+#  to run will be reconfigured. Others will be left as they are
+#  at this point.
+#
+#   Input:	1. required instances hashref
+#		2. running module instances hashref
+#		3. module instances configuration hashref
+#
+#   Output:	nothing
+#
+sub reconfigure_instances($$$) {
+    my ($required, $running, $instances) = @_;
+
+    # Serialized config should
+    # be as compact as possible
+    $Data::Dumper::Terse = 1;
+    $Data::Dumper::Indent = 0;
+    # Serialize new global configuration
+    my $api_dump = Dumper($API);
+
+    # Reconfigure existing module instances if they
+    # are still required by load balancers to run ...
+    foreach my $instance_name (keys %{$instances}) {
+	# If module instance is in the list
+	# of instances required to run ...
+	if(defined($required->{$instance_name}) &&
+	   ref($required->{$instance_name}) eq "ARRAY") {
+	    # This is our new instance
+	    my $pending_instance = $instances->{$instance_name};
+	    # This should be the instance with
+	    # the same name already running
+	    my $running_instance = $running->{$instance_name};
+	    # If such an instance exists ...
+	    if(defined($running_instance)) {
+		# Running instance's child process's PID
+		my $pid = $running_instance->{MAIN_PROC_DATA}{'pid'};
+		unless(defined($pid)) {
+		    $API->logging('LOG_WARNING', "PID not found for running %s module instance %s which should never happen",
+						 $running_instance->{'type'},
+						 $running_instance->{'instance'});
+		    next;
+		}
+		# If pending instance is of the same type
+		# as the running one, assume it is the same
+		# instance and reconfigure it
+		if($running_instance->{'type'} eq $pending_instance->{'type'}) {
+		    # Serialize instance's new configuration
+		    my $inst_dump = Dumper($pending_instance);
+		    # Copy instance's runtime data
+		    $pending_instance->{MAIN_PROC_DATA} = $running_instance->{MAIN_PROC_DATA};
+		    # Format config message
+		    my $msg = $pending_instance->config($api_dump, $inst_dump);
+		    # Insert new config message at the top of the queue
+		    unshift @{$pending_instance->{MAIN_PROC_DATA}{'queue'}}, $msg;
+		    # Replace instance in the list of running instances
+		    $MOD_RUNNING{$instance_name} = $pending_instance;
+		    # Replace instance in the list of running child processes
+		    $CHILD_PROC{$pid} = $pending_instance;
+		}
+	    }
+	}
+    }
+}
+#
+# Replace running instances
+#
+#  This function identifies instances already up and running and
+#  compares them against pending configuration changes. If running
+#  instance with given name is still required to run, but module
+#  type is different in pending configuration changes, it cannot
+#  be considered the same instance with new configuration, but
+#  a completely different instance with the same name. Therefore,
+#  we need to shut the old instance down and start the new one.
+#  We will simply use TERM signal to stop the old instance and
+#  leverage the respawn mechanism to start the new one.
+#
+#   Input:	1. required instances hashref
+#		2. running module instances hashref
+#		3. module instances configuration hashref
+#
+#   Output:	nothing
+#
+sub replace_instances($$$) {
+    my ($required, $running, $instances) = @_;
+
+    # Shut the module instances down if
+    # their module type has changed
+    foreach my $instance_name (keys %{$instances}) {
+	# If module instance is in the list
+	# of instances required to run ...
+	if(defined($required->{$instance_name}) &&
+	   ref($required->{$instance_name}) eq "ARRAY") {
+	    # This is our new instance
+	    my $pending_instance = $instances->{$instance_name};
+	    # This should be the instance with
+	    # the same name already running
+	    my $running_instance = $running->{$instance_name};
+	    # If such an instance exists ...
+	    if(defined($running_instance)) {
+		# ... get running instance's child process PID
+		my $pid = $running_instance->{MAIN_PROC_DATA}{'pid'};
+		if(defined($pid)) {
+		    # If pending instance is not of the same type as
+		    # the running one, it is not the same instance,
+		    # so we need to terminate the old one and let
+		    # the respawn mechanism start the new one.
+		    if($running_instance->{'type'} ne $pending_instance->{'type'}) {
+			# Send the TERM signal to the running instance
+			kill 'TERM', $pid;
+		    }
+		} else {
+		    $API->logging('LOG_WARNING', "PID not found for running %s module instance %s which should never happen",
+						 $running_instance->{'type'},
+						 $running_instance->{'instance'});
+		}
+	    }
+	}
+    }
+}
+#
+# Start load balancers
+#
+#  This function starts configured load balancers by scheduling
+#  them to be invoked in specified intervals. Load balancers
+#  will be started only if they are not running already and
+#  have at least one valid input and one valid output.
+#
+#   Input:	1. load balancers configuration hashref
+#
+#   Output:	1. TRUE, if successful
+#		   FALSE, if failed
+#
+sub start_loadbalancers($) {
+    my $loadbalancers = shift;
+
+    # Start load balancers
+    foreach my $lb_name (keys %{$loadbalancers}) {
+	# If load balancer is not running already ...
+	unless(defined($LB_RUNNING{$lb_name})) {
+	    # Get load balancer's configuration
+	    my $lb = $loadbalancers->{$lb_name};
+	    # At least one input must be configured
+	    unless(defined($lb->{'input'}) && keys %{$lb->{'input'}} > 0) {
+		$API->logging('LOG_ERR', "Load balancer %s has no configured inputs",
+					 $lb_name);
+		return 0;
+	    }
+	    # At least one output must be configured
+	    unless(defined($lb->{'output'}) && scalar(@{$lb->{'output'}}) > 0) {
+		$API->logging('LOG_ERR', "Load balancer %s has no configured outputs",
+					 $lb_name);
+		return 0;
+	    }
+	    # Reset last update timestamp
+	    $lb->{MAIN_PROC_DATA}{'last_update'} = time();
+	    # Reset sequence number
+	    $lb->{MAIN_PROC_DATA}{'seq_num'} = 1;
+	    # Schedule load balancer to be invoked regularly
+	    my $event = $EVMON->create_timer_event('interval' => $lb->{'update_interval'},
+						   'handler' => \&load_balancer,
+						   'args' => [ $lb_name ]);
+	    # If event creation failed ...
+	    unless(defined($event)) {
+		# ... make a note in the log
+		$API->logging('LOG_ERR', "Failed to start load balancer %s",
+					 $lb_name);
+		# ... return error
+		return 0;
+	    }
+	    # Save load balancer's timer event
+	    $lb->{MAIN_PROC_DATA}{'event'} = $event;
+	    # Save load balancer in the list
+	    # of running load balancers
+	    $LB_RUNNING{$lb_name} = $lb;
+	}
+    }
+
+    return 1;
+}
+#
+# Reconfigure running loadbalancers
+#
+#  Identify running load balancers and reconfigure them.
+#  Only load balancers that have at least one valid input
+#  and one valid output will be reconfigured. Others will
+#  be left as they are at this point.
+#
+#   Input:	1. running load balancers hashref
+#		2. load balancers configuration hashref
+#
+#   Output:	nothing
+#
+sub reconfigure_loadbalancers($$) {
+    my ($running, $loadbalancers) = @_;
+
+    # Search through load balancers ...
+    foreach my $lb_name (keys %{$loadbalancers}) {
+	# Look for the running load balancer
+	# with the same name
+	my $running_lb = $running->{$lb_name};
+	# If load balancer with the same name exists,
+	# assume it's the same one and reconfigure it
+	if(defined($running_lb)) {
+	    # Get load balancer's new configuration
+	    my $pending_lb = $loadbalancers->{$lb_name};
+	    # Load balancer still must have at least
+	    # one input and one output instance
+	    if(defined($pending_lb->{'input'}) &&
+	       keys %{$pending_lb->{'input'}} > 0 &&
+	       defined($pending_lb->{'output'}) &&
+	       scalar(@{$pending_lb->{'output'}}) > 0) {
+		# Copy running load balancer's runtime data
+		$pending_lb->{MAIN_PROC_DATA} = $running_lb->{MAIN_PROC_DATA};
+		# Modify load balancer's timer event
+		$pending_lb->{MAIN_PROC_DATA}{'event'} =
+		     $EVMON->modify_timer_event($running_lb->{MAIN_PROC_DATA}{'event'},
+						'interval' => $pending_lb->{'update_interval'});
+		# Replace load balancer's configuration
+		# in the list of running load balancers
+		$LB_RUNNING{$lb_name} = $pending_lb;
+	    }
+	}
+    }
+}
+#
+# Stop modules instances' no longer required
+#
+#  This function terminates instances' child processes
+#  if these instances are no longer required by any
+#  load balancer by sending them TERM signal.
+#
+#   Input:	1. required instances hashref
+#		2. running module instances hashref
+#
+#   Output:	nothing
+#
+sub stop_orphaned_instances($$) {
+    my ($required, $running) = @_;
+
+    # Identify running instances we need to terminate
+    foreach my $instance_name (keys %{$running}) {
+	# If module instance is not in the list
+	# of instances required to run ...
+	unless(defined($required->{$instance_name}) &&
+	       ref($required->{$instance_name}) eq "ARRAY") {
+	    # This is instance we need to terminate
+	    my $running_instance = $running->{$instance_name};
+	    # Running instance's child process's PID
+	    my $pid = $running_instance->{MAIN_PROC_DATA}{'pid'};
+	    # At this point, this should be defined
+	    # or something is seriosly wrong
+	    unless(defined($pid)) {
+		$API->logging('LOG_WARNING', "PID not found for %s module instance %s which is in running state",
+					     $running_instance->{'type'},
+					     $running_instance->{'instance'});
+		next;
+	    }
+	    # Make a note in the log
+	    $API->logging('LOG_WARNING', "Shutting down child process [pid %d] of no longer required %s module instance %s",
+					 $pid,
+					 $running_instance->{'type'},
+					 $running_instance->{'instance'});
+	    # Terminate child process
+	    kill 'TERM', $pid;
+	}
+    }
+}
+#
+# Stop removed or misconfigured load balancers
+#
+#  This function terminates running load balancers that
+#  have been removed from configuration or have been
+#  misconfigured after configuration reload.
+#
+#  Load balancers are required to have at least one
+#  valid input and one valid output at all times.
+#
+#   Input:	1. running load balancers hashref
+#		2. load balancers configuration hashref
+#
+#   Output:	nothing
+#
+sub stop_removed_loadbalancers($$) {
+    my ($running, $loadbalancers) = @_;
+
+    # Identify running loadbalancers we need to terminate
+    foreach my $lb_name (keys %{$running}) {
+	# Look for the load balancer with the same name
+	# in the new configuration ...
+	my $pending_lb = $loadbalancers->{$lb_name};
+	# If running load balancer is not in
+	# the new list of load balancers ...
+	unless(defined($pending_lb)) {
+	    # Make a note in the log
+	    $API->logging('LOG_INFO', "Shutting down removed load balancer %s",
+				      $lb_name);
+	# ... or new load balancer configuration
+	# is missing inputs and/or outputs ...
+	} elsif(!defined($pending_lb->{'input'}) ||
+		keys %{$pending_lb->{'input'}} < 1 ||
+		!defined($pending_lb->{'output'}) ||
+		scalar(@{$pending_lb->{'output'}}) < 1) {
+	    # Make a note in the log
+	    $API->logging('LOG_INFO', "Shutting down improperly configured load balancer %s",
+				      $lb_name);
+	# ... at last, if nothing else is missing ...
+	} else {
+	    # ... this load balancer is ok - skip it
+	    next;
+	}
+	# Get running load balancer
+	my $lb = $running->{$lb_name};
+	# Get running load balancer's timer event
+	my $event = $lb->{MAIN_PROC_DATA}{'event'};
+	undef $lb->{MAIN_PROC_DATA}{'event'};
+	# Stop timer event if it was scheduled
+	$EVMON->destroy_timer_event($event);
+	# Remove load balancer from the list
+	# of running load balancers
+	delete $LB_RUNNING{$lb_name};
+    }
+}
+#
+# Initialize major parts of the OpenLB
+#
+#  This function initializes load balancers and module instances
+#  they require to run. This is done only once, on startup.
+#
+#   Input:	nothing
+#
+#   Output:	1. TRUE, if initialization succeeded
+#		   FALSE, if failed
+#
+sub initialize() {
+    # Create list of module instances required to run.
+    # Instances not referenced by any load balancer
+    # do not need to run.
+    $REQUIRED = get_required_instances(\%MODULE, \%LOADBALANCER);
+    if(defined($REQUIRED)) {
+	# Create module instances
+	if(instantiate_modules($REQUIRED, \%MODULE)) {
+	    # Start module instances
+	    if(start_instances($REQUIRED, \%MODULE)) {
+		# Start load balancers
+		if(start_loadbalancers(\%LOADBALANCER)) {
+		    # Success
+		    return 1;
+		}
+	    }
+	}
+    }
+
+    # Failed
+    $API->logging('LOG_ERR', "OpenLB v%s failed to initialize",
+			     $VERSION);
+
+    return 0;
+}
+#
+# Reload configuration and reinitialize everything
+#
+#  This function loads new configuration and activates it.
+#  If all goes well, old configuration will be replaced
+#  with the new one. If activation fails, old configuration
+#  will be retained.
+#
+#   Input:	nothing
+#
+#   Output:	1. TRUE, if initialization succeeded
+#		   FALSE, if failed
+#
+sub reinitialize() {
+    my %config = ();
+    my %module = ();
+    my %loadbalancer = ();
+
+    # Announce configuration change
+    $API->logging('LOG_INFO', "Reloading configuration file %s",
+			      $CONFIGFILE);
+
+    # Local storage for new global config
+    $CONF->assign_destination('CONFIG', \%config);
+    # Local storage for new modules config
+    $CONF->assign_destination('MODULE', \%module);
+    # Local storage for new load balancer config
+    $CONF->assign_destination('LOADBALANCER', \%loadbalancer);
+    # Load new configuration
+    unless($CONF->load($CONFIGFILE)) {
+	$API->logging('LOG_ERR', "Failed to reload configuration file %s",
+				 $CONFIGFILE);
+	return 1;
+    }
+    # This is added while parsing command line options
+    # and is essential for logging in the foreground,
+    # so we have to copy it 'by hand'
+    if(defined($CONFIG{'foreground'})) {
+	$config{'foreground'} = $CONFIG{'foreground'};
+    }
+    # Turn our new configuration into
+    # API object to be passed to modules
+    my $new_api = api::base->new(\%config);
+    unless(defined($new_api)) {
+	$API->logging('LOG_WARNING', "Failed to reinitialize API");
+	return 1;
+    }
+    # Replace API object
+    my $old_api = $API;
+    $API = $new_api;
+
+    # Save current module instance and load balancer state
+    my %saved_mod_state = %MOD_RUNNING;
+    my %saved_lb_state = %LB_RUNNING;
+
+    # Create list of module instances required to run
+    my $required_instances = get_required_instances(\%module, \%loadbalancer);
+    if(defined($required_instances)) {
+	# Instantiate modules
+	if(instantiate_modules($required_instances, \%module)) {
+	    # Start module instances
+	    if(start_instances($required_instances, \%module)) {
+		# Start load balancers
+		if(start_loadbalancers(\%loadbalancer)) {
+		    # Reconfigure existing module instances
+		    reconfigure_instances($required_instances, \%saved_mod_state, \%module);
+		    # Reconfigure existing load balancers
+		    reconfigure_loadbalancers(\%saved_lb_state, \%loadbalancer);
+		    # Stop load balancers that were removed from configuration
+		    stop_removed_loadbalancers(\%saved_lb_state, \%loadbalancer);
+		    # Stop module instances no longer required by any load balancer
+		    stop_orphaned_instances($required_instances, \%saved_mod_state);
+
+		    # Replace active global config
+		    %CONFIG = %config;
+		    # Replace active module config
+		    %MODULE = %module;
+		    # Replace active load balancer config
+		    %LOADBALANCER = %loadbalancer;
+		    # Replace active list of required instances
+		    $REQUIRED = $required_instances;
+
+		    # Replace instances whose module type has changed
+		    replace_instances($required_instances, \%saved_mod_state, \%MODULE);
+
+		    return 1;
+		}
+		# Rollback - stop load balancers started during reinitialization
+		stop_removed_loadbalancers(\%LB_RUNNING, \%LOADBALANCER);
+	    }
+	    # Rollback - stop module instances started during reinitialization
+	    stop_orphaned_instances($REQUIRED, \%MOD_RUNNING);
+	}
+    }
+
+    # Rollback - restore previous API object
+    $API = $old_api;
+
+    $API->logging('LOG_ERR', "Failed to reinitialize with new configuration, retaining old one");
+
+    return 1;
+}
+#
+# Terminate child processes
+#
+#  This function is called both from main process in case
+#  of an error and SIGINT and SIGTERM handlers to signal
+#  child processes to exit.
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub terminate_children() {
+    foreach my $pid (keys %CHILD_PROC) {
+	kill 'TERM', $pid;
+    }
+}
+#
+# Terminate processing
+#
+#  This function is termination event handler used to
+#  shutdown event processing, signal child processes
+#  to exit and, ultimately, exit the progam itself.
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub terminate_all() {
+    # Initiate event engine shutdown. It will
+    # keep processing events, but it will
+    # no longer reflect running state, which
+    # will cause our own code to terminate.
+    $EVMON->shutdown();
+    # Signal all child processes to exit
+    terminate_children();
+    # Register recurring event that will keep
+    # returning the number of active child
+    # processes. Any number above zero will
+    # keep the main loop running. Once the last
+    # child process is reaped, child process
+    # count of zero will stop the event engine
+    # and make the main loop and the program
+    # itself exit.
+    $EVMON->create_recurring_event('handler' => sub { return keys %CHILD_PROC; });
+
+    return 1;
+}
+#
+# Calculate child process backoff value
+#
+#  This function takes current backoff value and the last
+#  known spawn time of a child process and calculates
+#  respawn delay interval (backoff value).
+#
+#  Backoff value is cumulative. Grows exponentially and
+#  decays by 1 for each second a child process remained up.
+#
+#  This means that in order to disolve the accumulated
+#  backoff completely, child process must remain up for
+#  at least the amount equal to the current backoff value.
+#  In case child process dies before its backoff has
+#  decayed to minimum of 1, whatever remains will continue
+#  to grow.
+#
+#   Input:	1. previous backoff value
+#		2. UNIX timestamp of the last process spawn
+#
+#   Output:	1. new backoff value
+#
+sub respawn_backoff($$) {
+    my ($backoff, $last_spawn_time) = @_;
+
+    # How long has this child been up ?
+    my $past_uptime = time() - $last_spawn_time;
+    # Cap minimum uptime to 0 seconds (no negative uptime)
+    $past_uptime = 0 if ($past_uptime < 0);
+    # Accumulated backoff decays by amount equal to uptime
+    # and whatever remains, grows exponentially
+    $backoff = 2 * (((defined($backoff) && $backoff > 0) ? $backoff:0) - $past_uptime);
+    # Cap backoff to:
+    if($backoff < 1) {
+	# minimum 1 second
+	$backoff = 1;
+    } elsif($backoff > $CONFIG{'max_respawn_delay'}) {
+	# maximum defined by configuration
+	$backoff = $CONFIG{'max_respawn_delay'};
+    }
+
+    return $backoff;
+}
+#
+# Get OpenLB daemon PID.
+#
+#   Input:		none
+#
+#   Output:		1. main process PID
+#
+#			on failure: undef
+#
+sub get_pid() {
+    my $pidfd;
+    my $pid;
+
+    if(-f $CONFIG{'pidfile'}) {
+	if(open($pidfd, $CONFIG{'pidfile'})) {
+	    $pid = <$pidfd>;
+	    close($pidfd);
+	}
+    }
+
+    return $pid;
+}
+#
+# Check if process with given PID is running.
+#
+#   Input:		1. PID
+#			2. optional process name
+#
+#   Output:		1. TRUE, if process is up
+#			   FALSE, if nothing was found
+#
+sub is_process($;$) {
+    my ($pid, $procname) = @_;
+    my $search = (defined($procname) && $procname ne "") ?
+		    $procname:'\S+';
+    my $ps = `ps aux`;
+    return ($ps =~ /\n\S+\s+$pid\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+$search/g) ? 1:0;
+}
+
+##############################################################################################
+#                                  A P I   F U N C T I O N S
+##############################################################################################
+
+#
+# Return base file name of this application
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub __get_progname() {
+    return $COMMAND;
+}
+#
+# Return version string of this application
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub __get_version() {
+    return $VERSION;
+}
+#
+# Return API base object reference
+#
+#  Input:	nothing
+#
+#  Output:	1. API base object reference
+#
+sub __get_api() {
+    return $API;
+}
+#
+# Return event monitor object reference
+#
+#  Input:	nothing
+#
+#  Output:	1. EVMON object reference
+#
+sub __get_evmon() {
+    return $EVMON;
+}
+#
+# Begin child process shutdown
+#
+#  This function is a wrapper for shutdown() method
+#  provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to
+#  event monitor object.
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub __shutdown() {
+
+    # Event monitor must be initialized
+    return unless(defined($EVMON) &&
+		  ref($EVMON) eq 'api::util::event');
+
+    $EVMON->shutdown();
+}
+#
+# Stop processing and exit child process
+#
+#  This function is a wrapper for stop() method
+#  provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to
+#  event monitor object.
+#
+#  Input:	nothing
+#
+#  Output:	nothing
+#
+sub __stop() {
+
+    # Event monitor must be initialized
+    return unless(defined($EVMON) &&
+		  ref($EVMON) eq 'api::util::event');
+
+    $EVMON->stop();
+}
+#
+# Verify if we are in running state
+#
+#  This function is a wrapper for running() method
+#  provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to
+#  event monitor object.
+#
+#  Input:	nothing
+#
+#  Output:	1. TRUE, if running
+#		   FALSE, if not
+#		   undef, if event monitor is not initialized
+#
+sub __running() {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    return $EVMON->running();
+}
+#
+# Verify if we are in shutdown state
+#
+#  This function is a wrapper for shutting_down() method
+#  provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to
+#  event monitor object.
+#
+#  Input:	nothing
+#
+#  Output:	1. TRUE, if shutting down
+#		   FALSE, if not
+#		   undef, if event monitor is not initialized
+#
+sub __shutting_down() {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    return $EVMON->shutting_down();
+}
+#
+# Verify if we are in stopped state
+#
+#  This function is a wrapper for stop() method
+#  provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to
+#  event monitor object.
+#
+#  Input:	nothing
+#
+#  Output:	1. TRUE, if stopped
+#		   FALSE, if not
+#		   undef, if event monitor is not initialized
+#
+sub __stopped() {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    return $EVMON->stopped();
+}
+#
+# Create termination event
+#
+#  This function is a wrapper for create_termination_event()
+#  method provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to event
+#  monitor object.
+#
+#   Input:	1. api::util::event::create_termination_event
+#		   params hash
+#
+#   Output:	1. termination event hashref, if successful
+#		   undef, if failed
+#
+sub __create_termination_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Set termination event
+    return $EVMON->create_termination_event(@_);
+}
+#
+# Create reaping event
+#
+#  This function is a wrapper for create_reaping_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. api::util::event::create_reaping_event
+#		   params hash
+#
+#   Output:	1. reaping event hashref, if successful
+#		   undef, if failed
+#
+sub __create_reaping_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Set reaping event
+    return $EVMON->create_reaping_event(@_);
+}
+#
+# Create reload event
+#
+#  This function is a wrapper for create_reload_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. api::util::event::create_reload_event
+#		   params hash
+#
+#   Output:	1. reload event hashref, if successful
+#		   undef, if failed
+#
+sub __create_reload_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Set reload event
+    return $EVMON->create_reload_event(@_);
+}
+#
+# Create recurring event
+#
+#  This function is a wrapper for create_recurring_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. api::util::event::create_recurring_event
+#		   params hash
+#
+#   Output:	1. recurring event hashref, if successful
+#		   undef, if failed
+#
+sub __create_recurring_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Set recurring event
+    return $EVMON->create_recurring_event(@_);
+}
+#
+# Create timer event
+#
+#  This function is a wrapper for create_timer_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. api::util::event::create_timer_event
+#		   params hash
+#
+#   Output:	1. timer event hashref, if successful
+#		   undef, if failed
+#
+sub __create_timer_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Set timer event
+    return $EVMON->create_timer_event(@_);
+}
+#
+# Create I/O event
+#
+#  This function is a wrapper for create_io_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. api::util::event::create_io_event
+#		   params hash
+#
+#   Output:	1. file handle, if successful
+#		   undef, if failed
+#
+sub __create_io_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Add I/O event
+    return $EVMON->create_io_event(@_);
+}
+#
+# Destroy termination event
+#
+#  This function is a wrapper for destroy_termination_event()
+#  method provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. event hashref returned by 
+#		   create_termination_event()
+#
+#   Output:	none
+#
+sub __destroy_termination_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_termination_event(@_);
+}
+#
+# Destroy reaping event
+#
+#  This function is a wrapper for destroy_reaping_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. event hashref returned by
+#		   create_reaping_event()
+#
+#   Output:	none
+#
+sub __destroy_reaping_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_reaping_event(@_);
+}
+#
+# Destroy reload event
+#
+#  This function is a wrapper for destroy_reload_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. event hashref returned by
+#		   create_reload_event()
+#
+#   Output:	none
+#
+sub __destroy_reload_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_reload_event(@_);
+}
+#
+# Destroy recurring event
+#
+#  This function is a wrapper for destroy_recurring_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. event hashref returned by
+#		   create_recurring_event()
+#
+#   Output:	none
+#
+sub __destroy_recurring_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_recurring_event(@_);
+}
+#
+# Destroy timer event
+#
+#  This function is a wrapper for destroy_timer_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. event hashref returned by
+#		   create_timer_event()
+#
+#   Output:	none
+#
+sub __destroy_timer_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_timer_event(@_);
+}
+#
+# Destroy I/O event
+#
+#  This function is a wrapper for destroy_io_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. file handle
+#		2. operation ('r'-read,'w'-write,'rw'-read/write)
+#
+#   Output:	none
+#
+sub __destroy_io_event($) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Remove event from event monitor
+    return $EVMON->destroy_io_event(@_);
+}
+#
+# Modify termination event
+#
+#  This function is a wrapper for modify_termination_event()
+#  method provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to event
+#  monitor object.
+#
+#   Input:	1. termination event hashref
+#		2. api::util::event::modify_termination_event
+#		   params hash
+#
+#   Output:	1. termination event hashref, if successfull
+#		   undef, if failed
+#
+sub __modify_termination_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify termination event
+    return $EVMON->modify_termination_event(@_);
+}
+#
+# Modify reaping event
+#
+#  This function is a wrapper for modify_reaping_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. reaping event hashref
+#		2. api::util::event::modify_reaping_event
+#		   params hash
+#
+#   Output:	1. reaping event hashref, if successfull
+#		   undef, if failed
+#
+sub __modify_reaping_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify reaping event
+    return $EVMON->modify_reaping_event(@_);
+}
+#
+# Modify reload event
+#
+#  This function is a wrapper for modify_reload_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. reload event hashref
+#		2. api::util::event::modify_reload_event
+#		   params hash
+#
+#   Output:	1. reload event hashref, if successfull
+#		   undef, if failed
+#
+sub __modify_reload_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify reload event
+    return $EVMON->modify_reload_event(@_);
+}
+#
+# Modify recurring event
+#
+#  This function is a wrapper for modify_recurring_event()
+#  method provided by api::util::event. It relies on global
+#  variable $EVMON to provide object reference to event
+#  monitor object.
+#
+#   Input:	1. recurring event hashref
+#		2. api::util::event::modify_recurring_event
+#		   params hash
+#
+#   Output:	recurring event hashref, if successfull
+#		undef, if failed
+#
+sub __modify_recurring_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify recurring event
+    return $EVMON->modify_recurring_event(@_);
+}
+#
+# Modify timer event
+#
+#  This function is a wrapper for modify_timer_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. timer event hashref
+#		2. api::util::event::modify_timer_event
+#		   params hash
+#
+#   Output:	1. timer event hashref, if successful
+#		   undef, if failed
+#
+sub __modify_timer_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify timer event
+    return $EVMON->modify_timer_event(@_);
+}
+#
+# Modify I/O event
+#
+#  This function is a wrapper for modify_io_event() method
+#  provided by api::util::event. It relies on global variable
+#  $EVMON to provide object reference to event monitor object.
+#
+#   Input:	1. file handle
+#		2. I/O operation ('r' - read , 'w' - write)
+#		3. api::util::event::modify_io_event params hash
+#
+#   Output:	1. file handle, if successful
+#		   undef, if failed
+#
+sub __modify_io_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Modify I/O event
+    return $EVMON->modify_io_event(@_);
+}
+#
+# Get event hashref
+#
+#  This function is a wrapper for get_event() method provided
+#  by api::util::event. It relies on global variable $EVMON
+#  to provide object reference to event monitor object.
+#
+#  Attpempts to identify the event which passed parameter
+#  belongs to.
+#
+#   Input:	1. event hashref or I/O event's file handle/descr
+#		2. I/O event's I/O operation (conditional)
+#
+#   Output:	1. event hashref, if suceeded
+#		   undef, if not found
+#
+sub __get_event(@) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Get specified event
+    return $EVMON->get_event(@_);
+}
+#
+# Delay next event trigger
+#
+#  This function is a wrapper for delay_event() method provided
+#  by api::util::event. It relies on global variable $EVMON to
+#  provide object reference to event monitor object.
+#
+#   Input:	1. event returned by create_xxxxx_event
+#		2. delay in seconds
+#
+#   Output:	1. TRUE, if suceeded
+#		   FALSE, if failed
+#
+sub __delay_event($) {
+
+    # Event monitor must be initialized
+    return undef unless(defined($EVMON) &&
+			ref($EVMON) eq 'api::util::event');
+
+    # Delay specified event
+    return $EVMON->delay_event(@_);
+}

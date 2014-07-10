@@ -1,0 +1,143 @@
+
+OpenLB's API, used by collector and backend modules, as well as the OpenLB
+daemon itself, is contained in several Perl modules. It has two major
+components - mandatory (base) component, which is loaded and provided to
+modules by the OpenLB daemon, and optional (util) component, consisting of
+several utility Perl modules, which can be loaded by modules on demand.
+
+Utils provide programming primitives and frequently used utility functions
+to speed up the development process of OpenLB modules.
+
+ - Class api::util::list provides an implementation of linked lists
+ - Class api::util::lru provides an implementation of a generic LRU cache.
+ - Class api::util::fifo provides an implementation of a generic FIFO queue.
+
+Class api::util::list
+---------------------
+
+This class provides the following methods:
+
+new()
+
+    Constructor method that returns an objref to the newly created list.
+
+head()
+
+    Returns the first node object in the list, or undef if the list
+    was empty.
+
+tail()
+
+    Returns the last node object in the list, or undef if the list
+    was empty.
+
+node()
+
+    Creates new node object. 
+
+next()
+
+    Returns next node in the list, or undef if it is the last node
+    in the list.
+
+prev()
+
+    Returns previous node in the list, or undef if it is the first
+    node in the list.
+
+add_head(node)
+
+    Adds a node object to the head of the list.
+
+add_tail(node)
+
+    Adds a node object to the tail of the list.
+
+get_head()
+
+    Removes and returns the first node in the list, or undef,
+    if the list was empty.
+
+get_tail()
+
+    Removes and returns the last node in the list, or undef,
+    if the list was empty.
+
+rem_node(node)
+
+    Removes specified node from the list, regardless of its position.
+
+insert_beforer(node, after)
+
+    Inserts the node 'node' into the list, before the node 'after'.
+
+insert_after(before, node)
+
+    Inserts the node 'node' into the list, after the node 'before'.
+
+
+Class api::util::lru
+--------------------
+
+This class provides the following methods:
+
+new(default_object_lifetime)
+
+    Constructor method that returns an objref to the newly created
+    LRU cache object.
+
+insert(object, object_lifetime)
+
+    Inserts 'an object' (any type of a scalar variable or a reference
+    to any type of variable can be used) into the LRU cache. If lifetime
+    wasn't specified, cache-wide default will be used. LRU cache is a
+    linked list that is kept sorted at all times, in ascending order.
+
+remove(object)
+
+    Removes 'an object' from the cache. This function should typically
+    be called when a cached object is being destroyed.
+
+refresh(object)
+
+    Resets the object's age. This function should typically be called
+    when a cached object is accessed to prevent it from expireing.
+
+first()
+
+    Removes and returns the oldest object in the cache or undef if
+    cache is empty.
+
+expired()
+
+    Removes and returns the oldest expired object in the cache or undef
+    if no objects have expired yet. It is typically used in a while()
+    loop, to reap all expired objects at once.
+
+
+Class api::util::fifo
+---------------------
+
+This class provides the following methods:
+
+new()
+
+    Constructor method that returns an objref to the newly created
+    FIFO queue object.
+
+put(object)
+
+    Puts 'an object' (any type of a scalar variable or a reference
+    to any type of variable can be used) to the tail of the queue.
+
+get()
+
+    Removes and returns an object from the head of the queue. Returns
+    undef, if queue is empty.
+
+remove(object)
+
+    Removes 'an object' from the queue. This function should typically
+    be called when a queued object needs to be destroyed while it's still
+    in the queue. This way we don't have to wait for object to be flushed
+    out of the queue - we can simply rip it out regardless of its position.

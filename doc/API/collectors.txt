@@ -1,0 +1,51 @@
+
+OpenLB collector modules are Perl packages implementing object methods
+that OpenLB daemon expects to find and call when required.
+
+Collector module must implement the following methods:
+
+ register(self)
+
+    Called without parameters (except implied $self, of course),
+    when the module is first loaded.
+
+    If collector requires configuration, register() should return a hashref
+    to configuration template in Config::ContextSensitive format.
+
+    If no configuration is neccessary, register() should return undef.
+
+ instantiate(self, conf_hashref)
+
+    Called when OpenLB starts launching collector child processes.
+
+    This is actually a constructor method. It takes a hash reference to
+    the collector configuration and bless()-es it into an object.
+
+    It must return the reference to the collector object, or undef
+    on failure.
+
+ run(self, api_base_objref)
+
+   Called with api::base object reference as the only parameter (preceeded
+   by implied $self) by the collector child process to act as the main run
+   loop of the collector.
+
+   This method should implement the core functionality of the collector.
+   It should run in the loop, collecting input data and delivering them
+   to the load balancer by writing to STDIN.
+
+   When this method returns, collector child process ends and OpenLB daemon
+   along with it.
+
+ shutdown(self)
+
+   Called without parameters (except implied $self) when OpenLB receives
+   SIGTERM or SIGINT signal.
+
+   This method should end the run loop when called.
+
+ device(self, api_base_objref, address_family)
+
+    Called by OpenLB API to retrieve the address of the device monitored
+    by this collector instance. If optional address family isn't explicitly
+    defined, IPv6 should be preferred.

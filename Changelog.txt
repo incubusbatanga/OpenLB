@@ -1,0 +1,355 @@
+Versions	  Changes made
+----------------------------------------------------------------------------
+  0.01		- Initial release
+
+  0.1		- API change: Function collect() has been removed from collector
+		  modules' API. Instead, communication between collectors and 
+		  the daemon and between load balancers and backends has been
+		  implemented by a clean set of abstractions - simple wrapper 
+		  functions that hide format of passed data from the modules. 
+		  Format of passed input data is, thus, no longer determined
+		  by collector modules, but by OpenLB API base, as it should be. 
+
+		- API change: added missing list mainpulation methods in API
+		  utils. Linked list support is now complete.
+
+		- API change: renamed LRU method queue() to insert() to better
+		  match the purpose of the class.
+
+		- Added generic database backend, supporting MySQL, Postgresql
+		  and Oracle database drivers. Implemented using Perl DBI module,
+		  so it requires proper DBD modules to be installed.
+
+		- Minor cosmetic changes.
+
+		- Added more API documentation.
+
+  0.2		- API change: added missing method first() to api::base::lru
+
+		- API change: added support for plain FIFO queues via new utility
+		  class api::util::fifo.
+		
+		- Fix: database backend had a potential endless loop
+		  in reconnect code.
+
+		- Updated API documentation.
+
+  0.3		- Fix: Added 'last updated' timestamp to each collector in order
+		  to verify validity of collected data. Data is considered stale
+		  (and therefore the monitored device is considered down) if it is
+		  older than 3 times the load balancer's update_interval. This
+		  will prevent non-responding collectors from being considered
+		  valid and their monitored devices from being assumed 'up'.
+
+		- Fix: Resolved data type ambiguity in a boolean comparison which
+		  caused 'down' devices to be seen by the default load balancer
+		  as if they were 'up'.
+
+		- Cleanup: Simplified the default load balancer's code.
+
+		- Cleanup: Removed unneccessary dereferencing operators from lines
+		  accessing COLLECTOR and BACKEND hashes within the main code.
+
+  0.4		- Feature: Added JSON format to http collector.
+
+		- Feature: Added full IPv6 support. IPv6 is now preferred unless
+		  specified otherwise.
+
+		- Improvement: Changed daemon start/stop code to be more flexibile
+		  and fault tolerant.
+
+		- API change: added get_device() method to allow backends to
+		  explicitly request collector addresses.
+
+		- API change: added is_ipv4() and is_ipv6() methods to
+		  api::base::network to save developers the trouble of making
+		  regexps for address family checks.
+
+		- API change: added get_host_by_name() method to api::base::network
+		  for quick and dirty hostname-to-IPv4-or-IPv6 resolving.
+
+		- Minor code cosmetic changes.
+
+  0.5		- API change: added api::util::event module which implements event
+		  engine providing event handling primitives. Base API's event
+		  handling code is now based on this engine.
+
+		- API change: added a number of event handling methods to base API.
+		  These are mostly wrappers for api::util::event methods.
+
+		- API change: modules are now child classes of api::module 'pure
+		  virtual' class.
+
+		  This class provides default implementation for some of module methods.
+		  These implementations can be overriden by module-specific ones.
+
+		  This class also provides autogeneration for common accessor methods
+		  (get_xxxx, set_xxxx, put_xxxx, push_xxxx, pop_xxxx, unshift_xxxx
+		  and shift_xxxx) used to define and obtain value(s) from modules'
+		  global scalars and arrays.
+
+		  This class also defines modules' common global variables required
+		  by OpenLB, like method retry and timeout values. These variables
+		  are inherited by all modules. Matching accessor methods for these
+		  variables can be considered a part of the module API.
+
+		- API change: added exists() and count() methods to api::util:fifo
+		  and api::util::lru.
+
+		- API change: added api::util::table class as a new complex data type.
+		  Essentialy, it's an indexed linked list that provides ordered
+		  inserion and removal of objects combined with fast access to objects
+		  via hash table.
+
+		- Improvement: all module method calls are timed. Methods that block
+		  either intentionally or unintentionally will be aborted on timeout.
+		  Modules can provide alternative implementation for each method
+		  managed by event engine that is invoked on timeout. Modules can
+		  also specify the number of attemts to complete each method call
+		  has.
+
+		- Improvement: spawning and running module child processes is now
+		  implemented using queues, with option to delay/schedule child
+		  process spawn.
+
+		  Module child processes are supervised and restarted if they die()
+		  or exit(). Respawning is delayed with exponential backoff to prevent
+		  CPU hogging when child process keeps failing. Backoff interval has
+		  a decay value that is equal to the uptime of the child process (in
+		  order to fully disolve accumulated backoff, child process has to
+		  stay up for at least a period of time equal to the current backoff
+		  interval).
+
+		  Module child processes are also dogwatched to prevent hangs. Each
+		  process regularly sends keepalives to the main process to signal
+		  their availability. Should the process hang, or simply perform
+		  lenghty operation that stops keepalive delivery, main process
+		  will kill() the offending child process and queue it for respawn
+		  (with appropriate backoff).
+
+		- Major architecture change: added a new class of modules - loopbacks.
+		  These modules integrate both collector and backend functionality.
+		  They receive load balancer data sets from the main process, operate
+		  on them and deliver results back to the main process (most likely
+		  a different load balancer instance, although nothing prevents
+		  creation of loops). This enables chaining of multiple load balancer
+		  instances, which, in turn, enables more complex load balancing based
+		  on heterogenous criteria and hierarchical decision-making..
+
+		- Major architecture change: modules no longer run data and event
+		  processing loops themselves. Module operations are now event driven
+		  (based on event processing engine provided by api::util::event).
+		  Intra-module pseudo-concurrency and asynchronicity is handled by
+		  OpenLB itself while collector and backend modules provide a number
+		  of non-blocking methods that are triggered by certain events.
+		  Module methods of interest to OpenLB can be mandatory, optional
+		  and registered:
+
+		  * Mandatory methods must be defined properly for a module to
+		    initialize.
+		  * Optional methods can but don't have to be defined by a module.
+		    If defined, they are triggered by certain events and might have
+		    to complete successfully, depending on type of method.
+
+		    If not defined, OpenLB provides default behaviour for these events.
+
+		  * Registered methods are callback functions explicitly registered
+		    by modules via OpenLB API. They act as event handlers for certain
+		    types of events like periodic and one-shot timer events, read
+		    and write file events.
+
+		  All methods with a defined timeout value can also have a timeout
+		  handler that can provide alternate way to complete operation and
+		  return proper values, or simply report an error.
+
+		  All registered events can have expiration interval defined,
+		  as well as limit on the number of event triggers. When event
+		  expires, callback function can be invoked, if defined.
+
+		  Collector modules now provide following methods:
+
+		    register		 - Unchanged
+
+		    instantiate		 - Unchanged
+
+		    daemonize		 - New optional method that configures
+					   child process parameters and creates and
+					   initializes instance data. The nature
+					   of instance data is not relevant to OpenLB.
+					   Whatever this method returns is passed
+					   on to other methods. If defined, this
+					   method must succeed, that is, it must not
+					   return undef.
+
+		    initialize		 - New optional method that initializes
+					   module core operations and registers
+					   input events and their handlers.
+
+		    initialize_timeout	 - New optional method that is invoked on
+					   initialize() timeout. It receives the
+					   same set of parameters and is expected
+					   to return the same type of value as
+					   initialize(). In essence, it may succeed
+					   where initilize() has failed. It can,
+					   however, simply report a timeout or even
+					   do absolutely nothing.
+
+		    reinitialize	 - New optional method that is invoked when
+					   collector child process receives SIGHUP.
+
+		    reinitialize_timeout - New optional method that is invoked on
+					   reinitialize() timeout. It receives the
+					   same set of parameters and is expected
+					   to return the same type of value as
+					   reinitialize() and its purpose is the
+					   same as all other xxxx_timeout methods.
+
+		    abort		 - This is essentially a renamed shutdown()
+					   method. It is optional and it's purpose is
+					   to abort the collector operations in progress.
+
+		    abort_timeout	 - New optional method that is invoked on
+					   abort() timeout. It provides alternative
+					   method for aborting operation in progress.
+
+		    cleanup		 - New optional method that is invoked right
+					   before collector child process ends to
+					   perform cleanup.
+
+		    cleanup_timeout	 - New optional method that is invoked on
+					   cleanup() timeout. It receives the
+					   same set of parameters as cleanup()
+					   and its purpose is the same as all other
+					   xxxx_timeout methods.
+
+		    host		 - This is essentially a renamed device()
+					   method. Provides IPv4 and IPv6 address
+					   of the resource monitored by collector.
+
+		    host_timeout	 - New optional method that is invoked on
+					   host() timeout. It provides alternative
+					   method for resolving resource's addresses.
+
+		  Backend modules now provide following methods:
+
+		    register		 - Unchanged
+
+		    instantiate		 - Unchanged
+
+		    daemonize		 - New optional method that configures
+					   child process parameters and creates and
+					   initializes instance data. The nature
+					   of instance data is not relevant to OpenLB.
+					   Whatever this method returns is passed
+					   on to other methods. If defined, this
+					   method must succeed, that is, it must not
+					   return undef.
+
+		    initialize		 - New optional method that initializes
+					   module core operations and registers
+					   input events and their handlers.
+
+		    initialize_timeout	 - New optional method that is invoked on
+					   initialize() timeout. It receives the
+					   same set of parameters and is expected
+					   to return the same type of value as
+					   initialize() and its purpose is the
+					   same as all other xxxx_timeout methods.
+
+		    reinitialize	 - New optional method that is invoked when
+					   backend child process receives SIGHUP.
+
+		    reinitialize_timeout - New optional method that is invoked on
+					   reinitialize() timeout. It receives the
+					   same set of parameters and is expected
+					   to return the same type of value as
+					   reinitialize() and its purpose is the
+					   same as all other xxxx_timeout methods.
+
+		    process		 - New mandatory method that is invoked when
+					   backend child process receives new dataset
+					   from load balancer.
+
+		    process_timeout      - New optional method that is invoked on
+					   process() timeout. It receives the
+					   same set of parameters and is expected
+					   to return the same type of value as
+					   process() and its purpose is the
+					   same as all other xxxx_timeout methods.
+
+		    abort		- This is essentially a renamed shutdown()
+					  method. It is optional and it's purpose is
+					  to abort a backend operation in progress.
+					  How it accomplishes this task is completely
+					  backend specific.
+
+		    abort_timeout	 - New optional method that is invoked on
+					   abort() timeout. It provides alternative
+					   method for aborting operation in progress.
+
+		    cleanup		- New optional method that is invoked right
+					  before backend child process ends to perform
+					  cleanup.
+
+		    cleanup_timeout	 - New optional method that is invoked on
+					   cleanup() timeout. It receives the
+					   same set of parameters as cleanup()
+					   and its purpose is the same as all other
+					   xxxx_timeout methods.
+
+		  Loopbacks implement all methods common to collectors and backends
+		  as well as all collector- and backend-specific ones, namely,
+		  collectors' host() and host_timeout() and backends' process() and
+		  process_timeout() methods.
+
+		- Modules: rewrote a major portion of dyndns backend which resulted
+		  in smaller and cleaner code.
+
+		- Modules: major feature improvement in nameserver backend - added
+		  split views option that allows matching the source addresses of
+		  DNS queries against statically or dynamically defined rules that
+		  determine the source and the nature of DNS responses and affect
+		  the ultimate outcome of the query-response process.
+
+		  Dynamic rules are created from BGP prefixes collected from local
+		  or remote Quagga/Zebra servers by mapping prefix next hops to
+		  load balancer instances or IP addresses directly.
+
+		- Fix: Code now properly verifies that modules implement methods
+		  before invoking them.
+
+  0.6		- Redesign: Event engine from OpenLB 0.5 that was imported into
+		  OpenAC project and heavily modified/improved is now merged
+		  back into OpenLB.
+
+		  All event types can be delayed on their first trigger. Also,
+		  new method delay_next() was introduced to delay the next event
+		  handler trigger by specified amount of time in seconds. This
+		  allows idle handlers (especially continuous event ones) to do
+		  a 'nonblocking sleep', that is to delay their next iteration
+		  and release CPU.
+
+		  Method poll() now performs operations in proper order.
+
+		- Redesign: Core daemon and API are now based on a much cleaner
+		  event-driven code merged back from OpenAC project.
+
+		  As a result, modules are no longer divided into collector,
+		  backend and loopback modules. Instead, every module can provide
+		  both collector and backend functionality, making all modules,
+		  effectively, what loopbacks were ment to be.
+
+		- Redesign: changed snmp module's dependency from Net::SNMP
+		  to SNMP module.
+
+		- Fix: Moved table index uniqueness check from collector to
+		  initialization code in snmp module, so that it doesn't
+		  interfere with periodic table index refresh and it's run
+		  only on startup to catch config errors, which was the original
+		  idea.
+
+		- Fix: Added input data sanity check to postgresql module.
+
+		- Improvement: added status command to the command line to fully
+		  comply with Heartbeat LSB script standard.
+

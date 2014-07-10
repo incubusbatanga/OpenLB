@@ -1,0 +1,45 @@
+
+OpenLB backend modules are Perl packages implementing object methods
+that OpenLB daemon expects to find and call when required.
+
+Backend module must implement the following methods:
+
+ register(self)
+
+    Called without parameters (except implied $self, of course),
+    when the module is first loaded.
+
+    If backend requires configuration, register() should return a hashref
+    to configuration template in Config::ContextSensitive format.
+
+    If no configuration is neccessary, register() should return undef.
+
+ instantiate(self, conf_hashref)
+
+    Called when OpenLB starts launching backend child processes.
+
+    This is actually a constructor method. It takes a hash reference to
+    the backend configuration and bless()-es it into an object.
+
+    It must return the reference to the backend object, or undef
+    on failure.
+
+ run(self, api_base_objref)
+
+   Called with api::base object reference as the only parameter (preceeded
+   by implied $self) by the backend child process to act as the main run
+   loop of the backend.
+
+   This method should implement the core functionality of the backend.
+   It should run in the loop, retrieving dataset rows from the load
+   balancer by calling fetchrow() and processing them.
+
+   when this method returns, backend child process ends and OpenLB daemon
+   along with it.
+
+ shutdown(self)
+
+   Called without parameters (except implied $self) when OpenLB receives
+   SIGTERM or SIGINT signal.
+
+   This method should end the run loop when called.

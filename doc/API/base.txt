@@ -1,0 +1,79 @@
+
+OpenLB's API, used by collector and backend modules, as well as the OpenLB
+daemon itself, is contained in several Perl modules. It has two major
+components - mandatory (base) component, which is loaded and provided to
+modules by the OpenLB daemon, and optional (util) component, consisting of
+several utility Perl modules, which can be loaded by modules on demand.
+
+Base exports the following methods:
+
+put_input_data(datafield1, datafield2, ...)
+
+    Called by collector module to send collected data to the OpenLB daemon.
+    Data fields are serialized ('packed' into a single line) and written
+    to the output file handle.
+
+get_input_data(channel)
+
+   Called by OpenLB daemon to retrieve collected data and return it as
+   an array of data fields to be processed by the load balancer.
+
+   The first element must be the status of the device that is monitored by
+   the collector instance. It is a boolean value - true meaning the device
+   is up, false meaning the device is down. The rest of array elements are
+   data fields containing various parameters and properties specific to 
+   the device monitored by the collector instance. Properties should be 
+   sorted in most-significant to least-significant order.
+
+   Default load balancer scheduler sorts collectors by comparing retrieved
+   arrays two by two. This is done by comparing array elements with the same
+   index, moving on to the next pair of elements only if the compared elements
+   are equal. This is why the array elements should be ordered - the decision
+   is made as soon as an unequal pair is found, so the more important sort
+   criteria should come before less important criteria. When the elements
+   are equal, the next pair in line acts as a tie breaker, and so on ...
+   Thus, this algorithm will try to balance the system accross all monitored
+   properties.
+
+   Load balancer schedulers other than the default may or may not require
+   collected data in any particular order.
+
+   Needles to say, although OpenLB doesn't prevent it, it is a bad idea
+   to compare collector instances of different type.
+
+put_dataset_row(channel, lb_inst, seq_num, collector_inst, host, pref)
+
+    Called by a load balancer instance to deliver an ordered dataset row
+    to backends. Data fields are serialized ('packed' into a single line) 
+    and written to the output file handle.
+
+get_dataset_row()
+
+    Called by backends to retrieve a pending dataset row. Returns an array
+    of dataset row fields in the following order:
+
+    1. load balancer instance name
+    2. dataset sequence number
+    3. collector instance name
+    4. monitored device preference
+
+    If no dataset rows are pending, undef is returned.
+
+get_collector(collector_inst_name)
+
+    Takes a collector instance name and returns a collector instance objref.
+
+get_device(collector_inst_name, address_family)
+
+    Takes a collector instance name and optional address family and returns
+    the IP address of the device monitored by given collector. If address
+    family is not explicitly defined, IPv6 address is preferred.
+
+get_backend(backend_inst_name)
+
+    Takes a backend instance name and returns a backend instance objref.
+
+get_progname()
+
+    Returns the filename of the OpenLB executable.
+

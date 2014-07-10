@@ -1,0 +1,24 @@
+
+OpenLB's network utility functions. Included through API base object.
+
+Exports the following methods:
+
+set_nonblocking(fd)
+
+    Puts file descriptor fd into non blocking mode.
+
+is_ipv4(address)
+
+    Verifies if given address string represents IPv4 address or prefix.
+
+is_ipv6(address)
+
+    Verifies if given address string represents IPv6 address or prefix.
+
+get_host_by_name(host, address_family)
+
+    Resolves host into IPv4 or IPv6 address, depending on the requested
+    address family. If address family is missing, IPv6 is preferred.
+
+    If given an IP address instead of hostname, it simply returns the
+    same value that was passed.

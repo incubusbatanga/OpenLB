@@ -1,0 +1,70 @@
+
+ #
+ # SNMP tables that hold indexes we may need in our queries
+ #
+ #  Given table OID will be walked and it's entry values will be 
+ #  matched against configured indexes' regexps. Each entry that
+ #  produces a match will be used as an index into various parts
+ #  of the SNMP tree. Each produced index is assigned a name by
+ #  which we can reference it in OID definitions.
+ #
+ table .1.3.6.1.2.1.2.2.1.2 size_from .1.3.6.1.2.1.2.1.0
+   refresh_interval 300
+   index ifIndex matching ^GigabitEthernet0\\/0$
+
+ #
+ # SNMP OIDs whose data we retrieve from monitored devices
+ #
+ #  These are our data sources. Each datasource is identified by
+ #  its unique name. It has a defined type and the OID itself.
+ #  Type 'gauge' is used for values that directly reflect the 
+ #  current status of some property and, therefore, are not
+ #  cumulative (ie. CPU load, temperature, number of sessions,...).
+ #  Type 'counter' is used for values that reflect the status
+ #  of some property historically - they accumulate over time,
+ #  so each reading can only yield a value greater or equal to
+ #  the previously read value (ie. bytes in, bytes out, ...)
+ #  Previosly defined indexes can be used here by their given
+ #  names as variables (variable is prefixed by '$').
+ #
+ gauge   cvpdnSystemTunnelTotal  .1.3.6.1.4.1.9.10.24.1.1.4.1.2.2
+ gauge   cvpdnSystemSessionTotal .1.3.6.1.4.1.9.10.24.1.1.4.1.3.2
+ gauge   cpmCPUTotal5sec         .1.3.6.1.4.1.9.9.109.1.1.1.1.3.1 
+ gauge   cpmCPUTotal1min         .1.3.6.1.4.1.9.9.109.1.1.1.1.4.1
+ gauge   cpmCPUTotal5min         .1.3.6.1.4.1.9.9.109.1.1.1.1.5.1
+ counter ifInOctets              .1.3.6.1.2.1.2.2.1.10.$ifIndex
+ counter ifOutOctets             .1.3.6.1.2.1.2.2.1.16.$ifIndex
+ counter ifInUcastPkts           .1.3.6.1.2.1.2.2.1.11.$ifIndex
+ counter ifOutUcastPkts          .1.3.6.1.2.1.2.2.1.17.$ifIndex
+
+ #
+ # Collector fields that we format using retrieved SNMP data
+ #
+ #  Each field is given a name, an operator and an expression 
+ #  that will be evaluated into a single value. Fields must
+ #  be defined in order in which they should be delivered to
+ #  the openlb daemon.
+ #
+ #  Expressions can use defined OID names as variables (variable
+ #  is prefixed with '$'). First, variables will be replaced with
+ #  their respective values. Then, the expression will be evaluated.
+ #  Last, the field will be assigned a value according to the field
+ #  operator: 
+ #  - equality operator (= , set) simply assigns a value to the field
+ #  - average operator (~ , avg) calculates average of currrent and
+ #    previous value in time between two checks.
+ #
+ field cpu_5m       set $cpmCPUTotal5min
+ field cpu_1m       set $cpmCPUTotal1min
+ field cpu_5s       set $cpmCPUTotal5sec
+ field pps          avg $ifInUcastPkts + $ifOutUcastPkts
+ field bps          avg ($ifInOctets * 8) + ($ifOutOctets * 8)
+ field num_sessions set $cvpdnSystemSessionTotal
+ field num_tunnels  set $cvpdnSystemTunnelTotal
+
+ #
+ # General collector parameters
+ #
+ check_interval	10
+ check_timeout	2
+ check_retries	5
