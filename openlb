@@ -1199,7 +1199,7 @@ sub launch_module_instance($) {
 						# Do some debug logging
 						$API->logging('LOG_DEBUG', "Module %s instance %s is receiving data but doesn't implement process() method: record discarded",
 									   $instance->{'type'},
-									   $instance->{'instance'});
+									   $instance_name);
 						return;
 					    }
 					    # Do we have a proper data record ?
@@ -1210,7 +1210,7 @@ sub launch_module_instance($) {
 						# Do some debug logging
 						$API->logging('LOG_DEBUG', "Module %s instance %s received an empty record from the main process",
 									   $instance->{'type'},
-									   $instance->{'instance'});
+									   $instance_name);
 					    }
 					# Did we receive config message ?
 					} elsif($instance->is_config($message)) {
@@ -1218,7 +1218,7 @@ sub launch_module_instance($) {
 					    unless(scalar(@data) == 2 && $data[0] ne '' && $data[1] ne '') {
 						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received incomplete configuration from main process",
 									 $instance->{'type'},
-									 $instance->{'instance'});
+									 $instance_name);
 						return;
 					    }
 					    # De-serialize global configuration
@@ -1226,7 +1226,7 @@ sub launch_module_instance($) {
 					    unless(defined($new_api) && ref($new_api) eq ref($API)) {
 						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received invalid global configuration from main process",
 									 $instance->{'type'},
-									 $instance->{'instance'});
+									 $instance_name);
 						return;
 					    }
 					    # Replace current global config with new one
@@ -1236,7 +1236,7 @@ sub launch_module_instance($) {
 					    unless(defined($new_instance) && ref($new_instance) eq ref($instance)) {
 						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: received invalid instance configuration from main process",
 									 $instance->{'type'},
-									 $instance->{'instance'});
+									 $instance_name);
 						return;
 					    }
 					    # Even though we don't really need to instantiate
