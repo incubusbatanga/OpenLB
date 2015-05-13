@@ -1248,13 +1248,13 @@ sub launch_module_instance($) {
 					    unless(defined($new_instance) && ref($new_instance) eq ref($instance)) {
 						$API->logging('LOG_ERR', "Module %s instance %s failed to reconfigure: instantiate() failed",
 									 $instance->{'type'},
-									 $instance->{'instance'});
+									 $instance_name);
 						return;
 					    }
 					    # Copy instance specific child process data
 					    $new_instance->{CHILD_PROC_DATA} = $instance->{CHILD_PROC_DATA};
 					    # Replace current instance with new one
-					    $MODULE{$instance->{'instance'}} = $instance = $new_instance;
+					    $MODULE{$instance_name} = $instance = $new_instance;
 					    # If module implements method for
 					    # reinitializing its internal data ...
 					    if(defined($method_reinitialize)) {
@@ -1271,10 +1271,10 @@ sub launch_module_instance($) {
 										    my $new_data = $method_reinitialize->(@_);
 										    # Returned data must be defined() even if it is
 										    # a simple boolean value. FALSE is also valid,
-										    # but not undef !
+										    # but undef is not!
 										    if(defined($new_data)) {
-											# Replace instance-specific data with
-											# whatever data method returned ...
+											# Replace instance-specific data
+											# with whatever method returned ...
 											$instance_data = $new_data;
 										    # Otherwise, undef is the sign of failure
 										    } else {
@@ -1301,8 +1301,8 @@ sub launch_module_instance($) {
 											# the timeout without trying to fix anything
 											# (which is perfectly legal).
 											if(defined($new_data)) {
-											    # Replace instance-specific data with
-											    # whatever data method returned ...
+											    # Replace instance-specific data
+											    # with whatever method returned ...
 											    $instance_data = $new_data;
 											}
 										    } else {
@@ -1318,12 +1318,12 @@ sub launch_module_instance($) {
 					    # Log success
 					    $API->logging('LOG_DEBUG', "Module %s instance %s reconfigured: replaced active configuration with one received from main process",
 								       $instance->{'type'},
-								       $instance->{'instance'});
+								       $instance_name);
 					} else {
 					    # Log unknown message
 					    $API->logging('LOG_WARNING', "Module %s instance %s: received unknown message from the main process",
 									 $instance->{'type'},
-									 $instance->{'instance'});
+									 $instance_name);
 					}
 				    }
 				    # Explicitly return nothing
