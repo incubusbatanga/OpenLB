@@ -1004,10 +1004,9 @@ sub launch_module_instance($) {
 	}
     }
 
-    # By default, termination handler
-    # will only stop event processing
-    # which will terminate the child
-    # process.
+    # By default, termination handler will only
+    # stop event processing which will terminate
+    # the child process.
     my %term = ( 'handler' => sub { $EVMON->stop(); } );
     # However, if module defines abort() method ...
     if(defined($method_abort)) {
@@ -1016,18 +1015,18 @@ sub launch_module_instance($) {
 	# Get abort() method timeout, if defined
 	my $timeout = $instance->get_abort_timeout();
 	# Termination handler's input parameters
-	%term = ('handler' => sub {
+	%term = ( 'handler' => sub {
 		    # Skip event hashref (implicit argument)
 		    shift;
 		    # Invoke abort() method
 		    $method_abort->(@_);
 		    # Explicitly return nothing
 		    return;
-		 },
-		 'args' => [ $instance, $instance_data ],
-		 'attempts' => defined($attempts) ? $attempts:1,
-		 'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
-		 'on_timeout' => sub {
+		  },
+		  'args' => [ $instance, $instance_data ],
+		  'attempts' => defined($attempts) ? $attempts:1,
+		  'timeout' => defined($timeout) ? $timeout:$CONFIG{'method_timeout'},
+		  'on_timeout' => sub {
 			# Does module provide custom timeout handler ?
 			if(defined($method_abort_timeout)) {
 			    # Invoke module specific timeout handler
@@ -1040,7 +1039,7 @@ sub launch_module_instance($) {
 			}
 			# Explicitly return nothing
 			return;
-		 });
+		  });
     }
     # Create termination event to exit
     # upon receiving SIGTERM or SIGINT
@@ -1058,7 +1057,7 @@ sub launch_module_instance($) {
 						    my $new_data = $method_initialize->(@_);
 						    # Returned data must be defined() even if it is
 						    # a simple boolean value. FALSE is also valid,
-						    # but not undef !
+						    # but undef is not!
 						    if(defined($new_data)) {
 							# Data returned by initialize()
 							# is our new instance data
@@ -1085,15 +1084,16 @@ sub launch_module_instance($) {
 								# Data returned by timeout handler
 								# is our new instance data
 								$instance_data = $new_data;
+								return 1;
 							    }
 							} else {
 							    # Generic method timeout report
 							    $API->logging('LOG_WARNING', "Module %s: initialize() timed out",
 											 $instance_name);
 							}
-							# Timeout handler always succeeds
-							return 1;
-						 });
+							# initialize() timed out
+							return 0;
+						  });
 	# initialize() method must succeed
 	unless($init_result) {
 	    $API->logging('LOG_ERR', "Module instance %s failed to initialize",
