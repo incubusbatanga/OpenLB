@@ -85,7 +85,7 @@ sub is_ipv4($$) {
 #		   FALSE otherwise
 #
 sub is_ipv6($$) {
-    return (defined($_[1]) && $_[1] =~ /^[a-fA-F\d]{0,4}(?:\:(?!\:\:)[a-fA-F\d]{1,4}){0,6}(?:\:\:)?(?:[a-fA-F\d]{1,4}\:(?!\:\:)){0,6}[a-fA-F\d]{0,4}(?:\/\d{1,2})?$/) ? 1:0;
+    return (defined($_[1]) && $_[1] =~ /^(?:((?=(?>.*?(::))(?!.*?\2)))\2?|([\da-f]{1,4}(?:\2|:\b|(?=[^\da-f]|\b))|\1))(?3){7}\/\d{1,2}$/i) ? 1:0;
 }
 #
 # Do a quick and dirty hostname resolving
